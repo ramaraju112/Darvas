@@ -4,14 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: 'portfolio = V6 ledger review; scan/backtest = V5 baseline'
+        description: 'portfolio = V6 ledger review; scan/backtest = legacy baseline scripts'
         type: choice
         required: true
         default: portfolio
-        options:
-          - portfolio
-          - scan
-          - backtest
+        options: [portfolio, scan, backtest]
 
 permissions:
   contents: write
@@ -25,7 +22,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           persist-credentials: true
@@ -34,19 +31,39 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: '3.11'
-          cache: pip
-          cache-dependency-path: requirements_v6.txt
 
-      - name: Install dependencies
-        run: |
-          set -euo pipefail
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements_v6.txt
-
-      - name: Check Python syntax
+      - name: Verify scripts and input files
+        env:
+          MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
           python -m py_compile darvas_v6_portfolio.py
+          if [ "$MODE" = portfolio ]; then
+            for f in portfolio_config.json portfolio_ledger.csv schwab_stop_confirmations.csv; do
+              test -f "$f" || { echo "::error::Missing $f"; exit 1; }
+            done
+          else
+            for f in darvas_fresh_v4.py darvas_fresh_v4_helper.py; do
+              test -f "$f" || { echo "::error::Legacy baseline missing $f"; exit 1; }
+            done
+            if [ "$MODE" = scan ]; then
+              test -f darvas_v5_excel.py || { echo '::error::Missing darvas_v5_excel.py'; exit 1; }
+            elif [ "$MODE" = backtest ]; then
+              test -f darvas_v5_backtest_excel.py || { echo '::error::Missing darvas_v5_backtest_excel.py'; exit 1; }
+            else
+              echo "::error::Unknown mode $MODE"; exit 1
+            fi
+          fi
+
+      - name: Install dependencies for selected mode
+        env:
+          MODE: ${{ inputs.mode }}
+        run: |
+          set -euo pipefail
+          python -m pip --version
+          if [ "$MODE" != portfolio ]; then
+            python -m pip install -r requirements_v6.txt --prefer-binary
+          fi
 
       - name: Run selected operation
         env:
@@ -56,49 +73,28 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p v6_reports
-          if [ "$MODE" = "portfolio" ]; then
-            for f in portfolio_config.json portfolio_ledger.csv schwab_stop_confirmations.csv; do
-              if [ ! -f "$f" ]; then
-                echo "::error::Missing required portfolio input: $f"
-                exit 1
-              fi
-            done
-            # Only trust monitor/scan outputs produced during this run.
-            # Never mistake an old checked-in CSV for fresh market data.
-            MONITOR_ARGS=(--monitor v6_reports/not_generated_monitor.csv --scan v6_reports/not_generated_scan.csv)
-            if [ -f darvas_fresh_v4.py ] && [ -f darvas_fresh_v4_helper.py ] && [ -s existing_dar_stocks.txt ]; then
-              python darvas_fresh_v4.py --mode monitor
-              if [ -f darvas_v4_monitor_results.csv ]; then
-                MONITOR_ARGS=(--monitor darvas_v4_monitor_results.csv --scan v6_reports/not_generated_scan.csv)
-              fi
+          if [ "$MODE" = portfolio ]; then
+            if [ -f darvas_v4_monitor_results.csv ]; then
+              echo 'Using existing V4/V5 monitor CSV; verify date and freshness manually.'
             else
-              echo "::warning::V5 monitor prerequisites missing; reviewing confirmed portfolio ledger and stops without fresh prices or signals."
+              echo '::warning::No V4/V5 monitor CSV found. Prices and new stops may be unavailable.'
             fi
-            python darvas_v6_portfolio.py "${MONITOR_ARGS[@]}" --telegram
-          elif [ "$MODE" = "scan" ]; then
-            for f in darvas_fresh_v4.py darvas_fresh_v4_helper.py darvas_v5_excel.py; do
-              if [ ! -f "$f" ]; then echo "::error::V5 scan requires missing file: $f"; exit 1; fi
-            done
+            python darvas_v6_portfolio.py --telegram
+          elif [ "$MODE" = scan ]; then
             python darvas_fresh_v4.py --mode scan --days 10
             python darvas_v5_excel.py --mode scan
-          elif [ "$MODE" = "backtest" ]; then
-            for f in darvas_fresh_v4.py darvas_fresh_v4_helper.py darvas_v5_backtest_excel.py; do
-              if [ ! -f "$f" ]; then echo "::error::V5 backtest requires missing file: $f"; exit 1; fi
-            done
+          elif [ "$MODE" = backtest ]; then
             python darvas_fresh_v4.py --mode backtest --period 5y
             python darvas_v5_backtest_excel.py
-          else
-            echo "::error::Unsupported mode: $MODE"
-            exit 1
           fi
 
-      - name: Persist alert deduplication state
+      - name: Persist deduplication state
         if: success() && inputs.mode == 'portfolio'
         run: |
           set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           if [ -f v6_alert_state.json ]; then
-            git config user.name 'github-actions[bot]'
-            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
             git add v6_alert_state.json
             if ! git diff --cached --quiet; then
               git commit -m 'chore: persist Darvas V6 alert state'
@@ -111,7 +107,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: darvas-v6-review-${{ inputs.mode }}-${{ github.run_id }}
+          name: darvas-review-${{ inputs.mode }}-${{ github.run_id }}
           path: |
             v6_reports/
             darvas_v4_*results.csv
