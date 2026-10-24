@@ -37,6 +37,7 @@ jobs:
           MODE: ${{ inputs.mode }}
         run: |
           set -euo pipefail
+          test -f darvas_v6_portfolio.py || { echo '::error::Missing darvas_v6_portfolio.py'; exit 1; }
           python -m py_compile darvas_v6_portfolio.py
           if [ "$MODE" = portfolio ]; then
             for f in portfolio_config.json portfolio_ledger.csv schwab_stop_confirmations.csv; do
@@ -44,7 +45,7 @@ jobs:
             done
           else
             for f in darvas_fresh_v4.py darvas_fresh_v4_helper.py; do
-              test -f "$f" || { echo "::error::Legacy baseline missing $f"; exit 1; }
+              test -f "$f" || { echo "::error::Legacy V5 $MODE mode requires missing $f"; exit 1; }
             done
             if [ "$MODE" = scan ]; then
               test -f darvas_v5_excel.py || { echo '::error::Missing darvas_v5_excel.py'; exit 1; }
