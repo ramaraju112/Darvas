@@ -1,0 +1,70 @@
+name: Darvas V6 - Five Year Multi-Box Backtest (Manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: darvas-v6-five-year-backtest
+  cancel-in-progress: false
+
+jobs:
+  backtest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements_v6.txt
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements_v6.txt
+
+      - name: Run five-year multi-box backtest
+        run: |
+          set -euo pipefail
+          mkdir -p v6_backtest_reports
+          # The portfolio ledger module is NOT the historical multi-box backtester.
+          # Detect likely dedicated entry points, but never simulate a successful backtest.
+          ENTRY=""
+          for candidate in \
+            darvas_v6_multibox_backtest.py \
+            darvas_v6_multi_box_backtest.py \
+            darvas_v6_backtest.py; do
+            if [ -f "$candidate" ]; then ENTRY="$candidate"; break; fi
+          done
+          if [ -z "$ENTRY" ]; then
+            echo '::error::No V6 historical multi-box backtest entry point found.'
+            echo 'Add the real historical backtest script and update this workflow to its actual CLI.'
+            echo 'darvas_v6_portfolio.py is a portfolio ledger module, not a five-year historical backtester.'
+            exit 1
+          fi
+          python -m py_compile "$ENTRY"
+          echo "::notice::Using detected entry point: $ENTRY"
+          # Review the backtester CLI before enabling execution: script arguments
+          # and expected output paths have not been verified from repository source.
+          python "$ENTRY" --help
+          echo '::error::Backtester CLI needs confirmation before performing a real 5-year run.'
+          exit 1
+
+      - name: Upload available backtest reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: darvas-v6-five-year-${{ github.run_id }}
+          path: |
+            v6_backtest_reports/
+            v6_reports/
+          if-no-files-found: warn
+          retention-days: 30
