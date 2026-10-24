@@ -1,4 +1,6 @@
+
 name: Darvas V6 Review - Manual Portfolio and V5 Baseline
+
 on:
   workflow_dispatch:
     inputs:
@@ -7,29 +9,63 @@ on:
         type: choice
         required: true
         default: portfolio
-        options: [portfolio, scan, backtest]
+        options:
+          - portfolio
+          - scan
+          - backtest
+
 permissions:
   contents: write
+
 concurrency:
   group: darvas-v6-review-state
   cancel-in-progress: false
+
 jobs:
   review:
     runs-on: ubuntu-latest
     timeout-minutes: 120
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
         with:
           persist-credentials: true
-       - uses: actions/setup-python@v6
-  with:
-    python-version: '3.11'
-    cache: pip
-    cache-dependency-path: requirements_v6.txt
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements_v6.txt
+
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
-          pip install -r requirements_v6.txt
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements_v6.txt
+
+      - name: Verify repository files
+        run: |
+          set -euo pipefail
+
+          echo "Checking Darvas repository..."
+
+          for file in \
+            requirements_v6.txt \
+            darvas_v6_portfolio.py \
+            portfolio_config.json \
+            portfolio_ledger.csv \
+            schwab_stop_confirmations.csv
+          do
+            if [ ! -f "$file" ]; then
+              echo "::error::Missing required file: $file"
+              exit 1
+            fi
+          done
+
+          echo "Core V6 files verified."
+
       - name: Run selected operation
         env:
           MODE: ${{ inputs.mode }}
@@ -37,27 +73,79 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           set -euo pipefail
-          if [ "$MODE" = portfolio ]; then
-            test -s existing_dar_stocks.txt
-            python darvas_fresh_v4.py --mode monitor
+
+          mkdir -p v6_reports
+
+          if [ "$MODE" = "portfolio" ]; then
+
+            echo "Running Darvas V6 portfolio review..."
+
+            if [ -f darvas_fresh_v4_helper.py ]; then
+              echo "Running legacy V5 monitor..."
+              python darvas_fresh_v4.py --mode monitor
+            else
+              echo "::warning::Legacy V5 helper missing."
+              echo "::warning::Running V6 ledger without fresh V5 monitor data."
+            fi
+
             python darvas_v6_portfolio.py --telegram
-          elif [ "$MODE" = scan ]; then
+
+          elif [ "$MODE" = "scan" ]; then
+
+            echo "Running V5 baseline scan..."
+
+            if [ ! -f darvas_v5_excel.py ] || \
+               [ ! -f darvas_fresh_v4_helper.py ]; then
+              echo "::error::V5 scan scripts are missing."
+              echo "Restore legacy V5 scripts before running scan."
+              exit 1
+            fi
+
             python darvas_fresh_v4.py --mode scan --days 10
             python darvas_v5_excel.py --mode scan
-          elif [ "$MODE" = backtest ]; then
+
+          elif [ "$MODE" = "backtest" ]; then
+
+            echo "Running V5 baseline backtest..."
+
+            if [ ! -f darvas_v5_backtest_excel.py ] || \
+               [ ! -f darvas_fresh_v4_helper.py ]; then
+              echo "::error::V5 backtest scripts are missing."
+              echo "Restore legacy V5 scripts before running backtest."
+              exit 1
+            fi
+
             python darvas_fresh_v4.py --mode backtest --period 5y
             python darvas_v5_backtest_excel.py
+
+          else
+
+            echo "::error::Invalid mode: $MODE"
+            exit 1
+
           fi
+
       - name: Persist only deduplication state
         if: success() && inputs.mode == 'portfolio'
         run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add v6_alert_state.json
-          if ! git diff --cached --quiet; then
-            git commit -m 'chore: persist Darvas V6 alert state'
-            git push
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ -f v6_alert_state.json ]; then
+            git add v6_alert_state.json
+
+            if ! git diff --cached --quiet; then
+              git commit -m "chore: persist Darvas V6 alert state"
+              git push
+            else
+              echo "No alert state changes."
+            fi
+          else
+            echo "No alert state file generated."
           fi
+
       - name: Upload generated reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -68,3 +156,4 @@ jobs:
             darvas_v4_*results.csv
             darvas_v5_*report.xlsx
           if-no-files-found: warn
+          retention-days: 30
