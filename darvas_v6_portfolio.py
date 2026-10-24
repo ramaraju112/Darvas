@@ -244,7 +244,12 @@ def main():
         old = json.loads(Path(args.state).read_text(encoding='utf-8'))
     current = {a['ticker']: hashlib.sha256(json.dumps(a, sort_keys=True).encode()).hexdigest() for a in alerts}
     new = [a for a in alerts if old.get(a['ticker']) != current[a['ticker']]]
-    if args.telegram:
+    telegram_ready = bool(os.environ.get('TELEGRAM_BOT_TOKEN') and os.environ.get('TELEGRAM_CHAT_ID'))
+    if args.telegram and not telegram_ready and new:
+        print('WARNING: Telegram secrets missing; alert state will not mark unsent alerts as delivered.', flush=True)
+        for a in new:
+            current.pop(a['ticker'], None)
+    elif args.telegram:
         for a in new:
             try:
                 send_telegram(f"DARVAS V6: {a['action']}\nStock: {a['ticker']}\nShares: {a['shares']}\nRecorded Schwab stop: {a['broker_stop'] or 'UNKNOWN'}\nSuggested stop: {a['suggested_stop'] or 'UNKNOWN'}\nCheck your working Schwab order manually. NO ORDER WAS PLACED.")
