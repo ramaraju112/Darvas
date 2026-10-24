@@ -1,0 +1,10 @@
+{
+  "starting_capital": 25000,
+  "portfolio_capital_limit": 25000,
+  "minimum_cash_reserve": 2000,
+  "maximum_positions": 5,
+  "initial_purchase_budget": 5000,
+  "suggested_addon_budget": 1250,
+  "cash_only": true,
+  "treat_limit_as_hard_equity_cap": false
+}
