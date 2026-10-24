@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: read
+  
 
 concurrency:
   group: darvas-v6-five-year-backtest
