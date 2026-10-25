@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       period:
-        description: "Yahoo Finance historical data period"
+        description: "Historical data period"
         required: true
         type: choice
         default: "5y"
@@ -16,10 +16,10 @@ on:
           - "10y"
 
       limit:
-        description: "Maximum stocks to test; 0 means all 400 stocks"
+        description: "Maximum stocks; 0 means all stocks in backtest_symbols.txt"
         required: true
         type: number
-        default: 5
+        default: 0
 
 permissions:
   contents: read
@@ -48,7 +48,7 @@ jobs:
             requirements_v6.txt \
             darvas_v6_backtest.py \
             darvas_fresh_v4.py \
-            symbols.txt
+            backtest_symbols.txt
           do
             if [ ! -f "$f" ]; then
               echo "::error::Missing required file: $f"
@@ -56,8 +56,8 @@ jobs:
             fi
           done
 
-          if [ ! -s symbols.txt ]; then
-            echo "::error::symbols.txt is empty"
+          if [ ! -s backtest_symbols.txt ]; then
+            echo "::error::backtest_symbols.txt is empty"
             exit 1
           fi
 
@@ -65,7 +65,7 @@ jobs:
             darvas_v6_backtest.py \
             darvas_fresh_v4.py
 
-          echo "File and syntax validation passed."
+          echo "Required files and Python syntax verified."
 
       - name: Install Python dependencies
         shell: bash
@@ -82,7 +82,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          python -c "import pandas, numpy, yfinance, requests, openpyxl; print('All required libraries imported successfully')"
+          python -c "import pandas, numpy, yfinance, requests, openpyxl; print('Dependencies verified')"
+
+      - name: Display selected stocks
+        shell: bash
+        run: |
+          echo "Stocks in backtest_symbols.txt:"
+          cat backtest_symbols.txt
 
       - name: Run Darvas V6 backtest
         shell: bash
@@ -93,10 +99,10 @@ jobs:
           set -euo pipefail
 
           echo "Historical period: $TEST_PERIOD"
-          echo "Maximum stocks: $LIMIT"
+          echo "Stock limit: $LIMIT"
 
           python -u darvas_v6_backtest.py \
-            --symbols symbols.txt \
+            --symbols backtest_symbols.txt \
             --period "$TEST_PERIOD" \
             --limit "$LIMIT" \
             --output darvas_v6_backtest_report.xlsx
@@ -108,7 +114,7 @@ jobs:
           set -euo pipefail
 
           if [ ! -s darvas_v6_backtest_report.xlsx ]; then
-            echo "::error::Backtest completed without producing a nonempty Excel report."
+            echo "::error::Excel report was not generated."
             exit 1
           fi
 
@@ -117,8 +123,10 @@ jobs:
 
           path = "darvas_v6_backtest_report.xlsx"
           wb = load_workbook(path, read_only=True)
+
           print("Excel report verified.")
           print("Worksheets:", ", ".join(wb.sheetnames))
+
           wb.close()
           PY
 
