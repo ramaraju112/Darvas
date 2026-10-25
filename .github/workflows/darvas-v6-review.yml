@@ -42,6 +42,7 @@ jobs:
             test -f "$f" || { echo "::error::Missing $f"; exit 1; }
           done
           if [ "${{ inputs.mode }}" = scan ]; then
+            test -f darvas_buy_ranking.py || { echo '::error::Missing darvas_buy_ranking.py'; exit 1; }
             test -f darvas_v5_excel.py || { echo '::error::Missing darvas_v5_excel.py'; exit 1; }
           else
             test -s existing_dar_stocks.txt || { echo '::error::Missing/empty existing_dar_stocks.txt'; exit 1; }
@@ -73,6 +74,7 @@ jobs:
           elif [ "$MODE" = scan ]; then
             python -u darvas_fresh_v4.py --mode scan --days 10
             python -u darvas_v5_excel.py --mode scan
+            python -u darvas_buy_ranking.py --input darvas_v5_scan_report.xlsx
           else
             echo "::error::Unsupported mode: $MODE"
             exit 1
