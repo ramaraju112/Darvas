@@ -126,27 +126,71 @@ def run_one(ticker,frame,config=None):
         trades.append(dict(**p,status='OPEN_AT_TEST_END',exit_date='',exit_price=None,exit_reason='CENSORED',proceeds=None,realized_pl=None,unrealized_pl=money(unreal),return_pct=round(100*unreal/p['spent'],2),calendar_days=(d.index[last]-d.index[p['entry_index']]).days,trading_sessions=last-p['entry_index']+1,final_mark=money(mark)))
     return trades,events,boxlog,adds,stops,dict(ticker=ticker,status='OK',bars=n,start=as_date(d,0),end=as_date(d,n-1))
 
-def excel(path,data,settings):
-    from artifact_tool import Workbook,SpreadsheetFile
-    wb=Workbook.create()
-    names=['SUMMARY','TRADE LEDGER','TRADE JOURNEY','BOX HISTORY','ADD-ON HISTORY','STOP HISTORY','MILESTONES','OPEN AT END','RULES & AUDIT','DATA COVERAGE']
-    trade,journey,box,addon,stop,coverage=data
-    closed=[t for t in trade if t['status']=='CLOSED']; opened=[t for t in trade if t['status']!='CLOSED']
-    summary=[dict(metric='Tickers checked',value=len(coverage)),dict(metric='Completed positions',value=len(closed)),dict(metric='Open at test end',value=len(opened)),dict(metric='Realized net P/L USD',value=money(sum(t['realized_pl'] for t in closed))),dict(metric='Unrealized P/L USD',value=money(sum(t['unrealized_pl'] for t in opened))),dict(metric='Add-on fills',value=sum(a['status']=='FILLED' for a in addon)),dict(metric='Stop exits',value=sum(t['exit_reason'].startswith('STOP') for t in closed)),dict(metric='Portfolio equity curve',value='NOT CALCULATED: isolated position replay')]
-    rules=[dict(rule='Initial budget per position',value=INITIAL),dict(rule='Each higher-box add budget',value=ADD),dict(rule='Initial entry',value='Next open after qualified daily breakout'),dict(rule='Add-on entry',value='Next open after higher-box close breakout; no extra filters'),dict(rule='Stop',value='Higher confirmed box low, ratchet up only, effective next bar'),dict(rule='Stop gaps',value='Open below stop exits at open minus slippage'),dict(rule='HT1 / HT2',value='Milestones, never terminal exits'),dict(rule='Fractional shares',value='NO'),dict(rule='Portfolio cash limits',value='NOT MODELED; independent per-position capital'),dict(rule='Same-bar ambiguity',value='Stop-first; OHLC cannot sequence events'),dict(rule='Survivorship bias',value='Present-day symbols are not point-in-time universe'),dict(rule='Adjustment',value='Unadjusted OHLC; splits/dividends can distort results'),dict(rule='Data source',value='Yahoo via yfinance; best effort'),dict(rule='Commission per order',value=settings.get('fee_per_order',0)),dict(rule='Slippage bps',value=settings.get('slippage_bps',0))]
-    mapping=[summary,trade,journey,box,addon,stop,[dict(ticker=t['ticker'],position_id=t['position_id'],ht1_first_touch=t['ht1_date'],ht2_first_touch=t['ht2_date']) for t in trade],opened,rules,coverage]
-    for name,rows in zip(names,mapping):
-        ws=wb.worksheets.add(name)
-        headers=list(dict.fromkeys(k for row in rows for k in row)) if rows else ['message']
+def excel(path, data, settings):
+    """Write the ten-tab research report with public openpyxl."""
+    from openpyxl import Workbook
+    from openpyxl.styles import Font, PatternFill, Alignment
+    from openpyxl.utils import get_column_letter
+    from datetime import date, datetime
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    names = ['SUMMARY', 'TRADE LEDGER', 'TRADE JOURNEY', 'BOX HISTORY',
+             'ADD-ON HISTORY', 'STOP HISTORY', 'MILESTONES', 'OPEN AT END',
+             'RULES & AUDIT', 'DATA COVERAGE']
+    trade, journey, box, addon, stop, coverage = data
+    closed = [t for t in trade if t['status'] == 'CLOSED']
+    opened = [t for t in trade if t['status'] != 'CLOSED']
+    summary = [
+        dict(metric='Tickers checked', value=len(coverage)),
+        dict(metric='Completed positions', value=len(closed)),
+        dict(metric='Open at test end', value=len(opened)),
+        dict(metric='Realized net P/L USD', value=money(sum(t['realized_pl'] for t in closed))),
+        dict(metric='Unrealized P/L USD', value=money(sum(t['unrealized_pl'] for t in opened))),
+        dict(metric='Add-on fills', value=sum(a['status'] == 'FILLED' for a in addon)),
+        dict(metric='Stop exits', value=sum(t['exit_reason'].startswith('STOP') for t in closed)),
+        dict(metric='Portfolio equity curve', value='NOT CALCULATED: isolated position replay')]
+    rules = [
+        dict(rule='Initial budget per position', value=INITIAL),
+        dict(rule='Each higher-box add budget', value=ADD),
+        dict(rule='Initial entry', value='Next open after qualified daily breakout'),
+        dict(rule='Add-on entry', value='Next open after higher-box close breakout; no extra filters'),
+        dict(rule='Stop', value='Higher confirmed box low, ratchet up only, effective next bar'),
+        dict(rule='Stop gaps', value='Open below stop exits at open minus slippage'),
+        dict(rule='HT1 / HT2', value='Milestones, never terminal exits'),
+        dict(rule='Fractional shares', value='NO'),
+        dict(rule='Portfolio cash limits', value='NOT MODELED; independent per-position capital'),
+        dict(rule='Same-bar ambiguity', value='Stop-first; OHLC cannot sequence events'),
+        dict(rule='Survivorship bias', value='Present-day symbols are not point-in-time universe'),
+        dict(rule='Adjustment', value='Unadjusted OHLC; splits/dividends can distort results'),
+        dict(rule='Data source', value='Yahoo via yfinance; best effort'),
+        dict(rule='Commission per order', value=settings.get('fee_per_order', 0)),
+        dict(rule='Slippage bps', value=settings.get('slippage_bps', 0))]
+    mapping = [summary, trade, journey, box, addon, stop,
+               [dict(ticker=t['ticker'], position_id=t['position_id'],
+                     ht1_first_touch=t['ht1_date'], ht2_first_touch=t['ht2_date']) for t in trade],
+               opened, rules, coverage]
+    for name, rows in zip(names, mapping):
+        ws = wb.create_sheet(name)
+        headers = list(dict.fromkeys(key for row in rows for key in row)) if rows else ['message']
+        ws.append(headers)
         if rows:
-            matrix=[headers]+[[v if isinstance(v,(str,int,float,bool)) or v is None else str(v) for v in (row.get(k) for k in headers)] for row in rows]
-        else:matrix=[headers,['No records']]
-        # Large sheets written in moderate batches to avoid memory spikes.
-        for start in range(0,len(matrix),400): ws.get_range_by_indexes(start,0,len(matrix[start:start+400]),len(headers)).values=matrix[start:start+400]
-        ws.get_range_by_indexes(0,0,1,len(headers)).format.fill='#17365D'
-        ws.get_range_by_indexes(0,0,1,len(headers)).format.font.color='#FFFFFF'
-        ws.freeze_panes.freeze_rows(1)
-    SpreadsheetFile.export_xlsx(wb).save(str(path))
+            for row in rows:
+                ws.append([v if isinstance(v, (str, int, float, bool, date, datetime)) or v is None
+                           else str(v) for v in (row.get(k) for k in headers)])
+        else:
+            ws.append(['No records'])
+        ws.freeze_panes = 'A2'
+        ws.auto_filter.ref = ws.dimensions
+        for cell in ws[1]:
+            cell.fill = PatternFill('solid', fgColor='17365D')
+            cell.font = Font(color='FFFFFF', bold=True)
+            cell.alignment = Alignment(wrap_text=True)
+        for idx, header in enumerate(headers, 1):
+            ws.column_dimensions[get_column_letter(idx)].width = min(48, max(14, len(str(header)) + 3))
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(str(path))
 
 def main():
     a=argparse.ArgumentParser();a.add_argument('--symbols',default='symbols.txt');a.add_argument('--period',default='5y');a.add_argument('--output',default='darvas_v6_backtest_report.xlsx');a.add_argument('--limit',type=int,default=0);a.add_argument('--fee',type=float,default=0);a.add_argument('--slippage-bps',type=float,default=0);a.add_argument('--data-dir',default='');args=a.parse_args()
