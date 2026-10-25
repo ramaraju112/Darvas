@@ -1,4 +1,3 @@
-
 name: Darvas V6 - Five Year Multi-Box Backtest (Manual)
 
 on:
@@ -14,7 +13,6 @@ on:
           - "2y"
           - "5y"
           - "10y"
-
       limit:
         description: "Maximum stocks; 0 means all stocks in backtest_symbols.txt"
         required: true
@@ -29,67 +27,45 @@ jobs:
     name: Darvas V6 Historical Backtest
     runs-on: ubuntu-24.04
     timeout-minutes: 120
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Set up Python 3.11
         uses: actions/setup-python@v6
         with:
           python-version: "3.11"
-
       - name: Validate required files
         shell: bash
         run: |
           set -euo pipefail
-
-          for f in \
-            requirements_v6.txt \
-            darvas_v6_backtest.py \
-            darvas_fresh_v4.py \
-            backtest_symbols.txt
-          do
+          for f in requirements_v6.txt darvas_v6_backtest.py darvas_fresh_v4.py backtest_symbols.txt; do
             if [ ! -f "$f" ]; then
               echo "::error::Missing required file: $f"
               exit 1
             fi
           done
-
           if [ ! -s backtest_symbols.txt ]; then
             echo "::error::backtest_symbols.txt is empty"
             exit 1
           fi
-
-          python -m py_compile \
-            darvas_v6_backtest.py \
-            darvas_fresh_v4.py
-
+          python -m py_compile darvas_v6_backtest.py darvas_fresh_v4.py
           echo "Required files and Python syntax verified."
-
       - name: Install Python dependencies
         shell: bash
         run: |
           set -euo pipefail
-
           python -m pip install --upgrade pip
-          python -m pip install \
-            -r requirements_v6.txt \
-            --prefer-binary
-
+          python -m pip install -r requirements_v6.txt --prefer-binary
       - name: Verify installed libraries
         shell: bash
         run: |
           set -euo pipefail
-
           python -c "import pandas, numpy, yfinance, requests, openpyxl; print('Dependencies verified')"
-
       - name: Display selected stocks
         shell: bash
         run: |
           echo "Stocks in backtest_symbols.txt:"
           cat backtest_symbols.txt
-
       - name: Run Darvas V6 backtest
         shell: bash
         env:
@@ -97,39 +73,30 @@ jobs:
           LIMIT: ${{ inputs.limit }}
         run: |
           set -euo pipefail
-
           echo "Historical period: $TEST_PERIOD"
           echo "Stock limit: $LIMIT"
-
           python -u darvas_v6_backtest.py \
             --symbols backtest_symbols.txt \
             --period "$TEST_PERIOD" \
             --limit "$LIMIT" \
             --output darvas_v6_backtest_report.xlsx
-
       - name: Verify Excel report
         if: success()
         shell: bash
         run: |
           set -euo pipefail
-
           if [ ! -s darvas_v6_backtest_report.xlsx ]; then
             echo "::error::Excel report was not generated."
             exit 1
           fi
-
           python - <<'PY'
           from openpyxl import load_workbook
-
           path = "darvas_v6_backtest_report.xlsx"
           wb = load_workbook(path, read_only=True)
-
           print("Excel report verified.")
           print("Worksheets:", ", ".join(wb.sheetnames))
-
           wb.close()
           PY
-
       - name: Upload backtest Excel report
         if: always()
         uses: actions/upload-artifact@v4
