@@ -1,64 +1,128 @@
+
 name: Darvas V6 - Five Year Multi-Box Backtest (Manual)
 
 on:
   workflow_dispatch:
     inputs:
       period:
-        description: 'Yahoo Finance historical data period'
+        description: "Yahoo Finance historical data period"
         required: true
         type: choice
-        default: '5y'
-        options: ['1y', '2y', '5y', '10y']
+        default: "5y"
+        options:
+          - "1y"
+          - "2y"
+          - "5y"
+          - "10y"
+
       limit:
-        description: 'Maximum symbols; 0 means all symbols.txt entries'
+        description: "Maximum stocks to test; 0 means all 400 stocks"
         required: true
         type: number
-        default: 0
+        default: 5
 
 permissions:
   contents: read
 
 jobs:
   backtest:
+    name: Darvas V6 Historical Backtest
     runs-on: ubuntu-24.04
     timeout-minutes: 120
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Python 3.11
+      - name: Set up Python 3.11
         uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Validate files and Python syntax
+      - name: Validate required files
+        shell: bash
         run: |
           set -euo pipefail
-          for f in requirements_v6.txt darvas_v6_backtest.py darvas_fresh_v4.py symbols.txt; do
-            test -f "$f" || { echo "::error::Missing $f"; exit 1; }
+
+          for f in \
+            requirements_v6.txt \
+            darvas_v6_backtest.py \
+            darvas_fresh_v4.py \
+            symbols.txt
+          do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing required file: $f"
+              exit 1
+            fi
           done
-          test -s symbols.txt || { echo '::error::symbols.txt is empty'; exit 1; }
-          python -m py_compile darvas_v6_backtest.py darvas_fresh_v4.py
 
-      - name: Install backtest dependencies
+          if [ ! -s symbols.txt ]; then
+            echo "::error::symbols.txt is empty"
+            exit 1
+          fi
+
+          python -m py_compile \
+            darvas_v6_backtest.py \
+            darvas_fresh_v4.py
+
+          echo "File and syntax validation passed."
+
+      - name: Install Python dependencies
+        shell: bash
         run: |
           set -euo pipefail
-          python -m pip install -r requirements_v6.txt --prefer-binary
-          python -c 'import pandas, numpy, yfinance, artifact_tool; print("Dependencies imported")'
 
-      - name: Run five-year multi-box backtest
+          python -m pip install --upgrade pip
+          python -m pip install \
+            -r requirements_v6.txt \
+            --prefer-binary
+
+      - name: Verify installed libraries
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python -c "import pandas, numpy, yfinance, requests, openpyxl; print('All required libraries imported successfully')"
+
+      - name: Run Darvas V6 backtest
+        shell: bash
         env:
           TEST_PERIOD: ${{ inputs.period }}
           LIMIT: ${{ inputs.limit }}
         run: |
           set -euo pipefail
-          python darvas_v6_backtest.py \
+
+          echo "Historical period: $TEST_PERIOD"
+          echo "Maximum stocks: $LIMIT"
+
+          python -u darvas_v6_backtest.py \
             --symbols symbols.txt \
             --period "$TEST_PERIOD" \
             --limit "$LIMIT" \
             --output darvas_v6_backtest_report.xlsx
 
-      - name: Upload backtest results
+      - name: Verify Excel report
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -s darvas_v6_backtest_report.xlsx ]; then
+            echo "::error::Backtest completed without producing a nonempty Excel report."
+            exit 1
+          fi
+
+          python - <<'PY'
+          from openpyxl import load_workbook
+
+          path = "darvas_v6_backtest_report.xlsx"
+          wb = load_workbook(path, read_only=True)
+          print("Excel report verified.")
+          print("Worksheets:", ", ".join(wb.sheetnames))
+          wb.close()
+          PY
+
+      - name: Upload backtest Excel report
         if: always()
         uses: actions/upload-artifact@v4
         with:
