@@ -1,0 +1,128 @@
+name: Darvas V6 Review - Manual Portfolio and V5 Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Portfolio = manual V6 ledger and V5 monitor; Scan = current V5 stock scan'
+        type: choice
+        required: true
+        default: scan
+        options:
+          - scan
+          - portfolio
+
+permissions:
+  contents: write
+
+concurrency:
+  group: darvas-v6-review-state
+  cancel-in-progress: false
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Check required files
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in requirements_v6.txt darvas_fresh_v4.py; do
+            test -f "$f" || { echo "::error::Missing $f"; exit 1; }
+          done
+          if [ "${{ inputs.mode }}" = scan ]; then
+            test -f darvas_breakout_tracker.py || { echo '::error::Missing darvas_breakout_tracker.py'; exit 1; }
+            test -f darvas_buy_ranking.py || { echo '::error::Missing darvas_buy_ranking.py'; exit 1; }
+            test -f darvas_v5_excel.py || { echo '::error::Missing darvas_v5_excel.py'; exit 1; }
+          else
+            test -s existing_dar_stocks.txt || { echo '::error::Missing/empty existing_dar_stocks.txt'; exit 1; }
+            test -f darvas_v6_portfolio.py || { echo '::error::Missing darvas_v6_portfolio.py'; exit 1; }
+          fi
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then
+            python -m pip install -r requirements.txt --prefer-binary
+          fi
+          python -m pip install -r requirements_v6.txt --prefer-binary
+          python -c 'import pandas, openpyxl, xlsxwriter; print("Spreadsheet libraries available")'
+
+      - name: Run selected operation
+        shell: bash
+        env:
+          MODE: ${{ inputs.mode }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = portfolio ]; then
+            python -u darvas_fresh_v4.py --mode monitor
+            python -u darvas_v6_portfolio.py --telegram
+          elif [ "$MODE" = scan ]; then
+            python -u darvas_fresh_v4.py --mode scan --days 10
+            python -u darvas_v5_excel.py --mode scan
+            python -u darvas_buy_ranking.py --input darvas_v5_scan_report.xlsx
+            python -u darvas_breakout_tracker.py --input darvas_v5_scan_report.xlsx --registry v6_breakout_signals.csv
+          else
+            echo "::error::Unsupported mode: $MODE"
+            exit 1
+          fi
+
+      - name: Persist breakout signal registry
+        if: success() && inputs.mode == 'scan'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f v6_breakout_signals.csv ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add v6_breakout_signals.csv
+            if ! git diff --cached --quiet; then
+              git commit -m 'chore: persist V6 breakout signal history'
+              git pull --rebase origin "${GITHUB_REF_NAME}"
+              git push origin "HEAD:${GITHUB_REF_NAME}"
+            fi
+          fi
+
+      - name: Persist only deduplication state
+        if: success() && inputs.mode == 'portfolio'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f v6_alert_state.json ]; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add v6_alert_state.json
+            if ! git diff --cached --quiet; then
+              git commit -m 'chore: persist Darvas V6 alert state'
+              git push
+            fi
+          fi
+
+      - name: Upload generated reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: darvas-v6-review-${{ inputs.mode }}-${{ github.run_id }}
+          path: |
+            v6_reports/
+            darvas_v4_reports/
+            darvas_v4_*results.csv
+            darvas_v5_*report.xlsx
+            v6_breakout_signals.csv
+          if-no-files-found: warn
+          retention-days: 30
