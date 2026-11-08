@@ -1,0 +1,17 @@
+name: Darvas V7.1 Tests
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'v7_1/**'
+      - '.github/workflows/darvas-v71-tests.yml'
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r v7_1/requirements.txt
+      - run: PYTHONPATH=v7_1 pytest -q v7_1/tests
