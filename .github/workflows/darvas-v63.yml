@@ -1,0 +1,36 @@
+name: Darvas V6.3 Full Market Daily
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: '0 = all eligible stocks; use 100 to smoke test'
+        required: true
+        default: '100'
+  schedule:
+    - cron: '30 23 * * 1-5'
+permissions:
+  contents: read
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: v6_3/requirements_v63.txt
+      - run: python -m pip install -r v6_3/requirements_v63.txt
+      - name: Build complete universe
+        run: python v6_3/darvas_v63.py universe --limit ${{ github.event_name == 'schedule' && '0' || inputs.limit }}
+      - name: Scan daily bars
+        run: python v6_3/darvas_v63.py scan --batch-size 40 --pause 1
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: darvas-v63-${{ github.run_number }}
+          path: v6_3/output/
+          if-no-files-found: warn
+          retention-days: 30
