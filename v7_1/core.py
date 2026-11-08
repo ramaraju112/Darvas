@@ -84,6 +84,7 @@ def import_signals(con,data,filename):
         parsed.append((sym,str(r.get('name','')),str(r['asof']),str(r['status']),number(r['close']),number(r['box_top']),number(r['box_bottom']),number(r.get('volume_ratio')),number(r.get('avg_dollar_volume20')),str(r.get('strategy',''))))
     with con:
         if not _import_record(con,'signals',data,filename,str(df['asof'].max())):return 0,'duplicate'
+        con.execute('DELETE FROM signals')
         con.executemany('INSERT INTO signals VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(symbol) DO UPDATE SET name=excluded.name,asof=excluded.asof,status=excluded.status,close=excluded.close,box_top=excluded.box_top,box_bottom=excluded.box_bottom,volume_ratio=excluded.volume_ratio,avg_dollar_volume20=excluded.avg_dollar_volume20,strategy=excluded.strategy',parsed)
     return len(parsed),'imported'
 

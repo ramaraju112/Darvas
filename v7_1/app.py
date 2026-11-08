@@ -4,6 +4,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from core import db,import_positions,import_orders,import_signals,actions,opportunities,read,log_actions,number,now
+from auto_scan import sync_bundled_scan
 
 st.set_page_config(page_title='Darvas V7.1 Command Center',page_icon='📈',layout='wide')
 st.markdown('''<style>.block-container{padding-top:1.2rem}div[data-testid="stMetric"]{background:#17223512;border-radius:12px;padding:12px}h1,h2,h3{letter-spacing:-.035em}</style>''',unsafe_allow_html=True)
@@ -25,13 +26,20 @@ if not st.session_state.get('authenticated'):
         else:st.error('Incorrect password')
     st.stop()
 
+try:
+    scan_sync_status = sync_bundled_scan(con)
+except Exception as exc:
+    scan_sync_status = f'Automatic market scan import failed: {exc}'
+    st.error(scan_sync_status)
+
 st.title('📈 Darvas V7.1 | Trading Command Center')
 st.caption('Research and portfolio oversight only • No automatic brokerage execution • V6.3 scan signals are not yet book-certified')
 with st.sidebar:
     st.header('System status')
+    st.caption(scan_sync_status)
     imports=read(con,'SELECT kind,MAX(imported_at) AS last_import,COUNT(*) AS files FROM imports GROUP BY kind')
     for r in imports.itertuples():st.caption(f'{r.kind}: {r.last_import} UTC')
-    st.info('Schwab data updates only when you upload a new export. Market snapshots remain historical until refreshed.')
+    st.info('Market scans update automatically after a successful GitHub Actions scan and Render deployment. Schwab data still requires manual upload.')
     if st.button('Log out'):st.session_state.authenticated=False;st.rerun()
 
 # Streamlit refreshes the visible view every five minutes, but does not claim to fetch a new scan.
