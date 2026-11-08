@@ -1,0 +1,78 @@
+name: Darvas V7.1 Automatic Market Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Number of stocks for a test run (0 = full universe)'
+        required: true
+        default: '100'
+        type: string
+  schedule:
+    - cron: '30 23 * * 1-5' # 23:30 UTC weekdays, after US market close
+
+permissions:
+  contents: write
+
+concurrency:
+  group: darvas-v71-auto-market
+  cancel-in-progress: false
+
+jobs:
+  scan-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install scanner requirements
+        run: python -m pip install -r v6_3/requirements_v63.txt
+      - name: Build stock universe
+        env:
+          SCAN_LIMIT: ${{ github.event_name == 'schedule' && '0' || inputs.limit }}
+        run: python v6_3/darvas_v63.py universe --limit "$SCAN_LIMIT"
+      - name: Scan daily market data
+        run: python v6_3/darvas_v63.py scan --batch-size 40 --pause 1
+      - name: Validate and publish market scan
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          import pandas as pd
+          source = Path('v6_3/output/scan_all.csv')
+          if not source.is_file():
+              raise SystemExit('Scan did not produce scan_all.csv; existing dashboard data preserved')
+          df = pd.read_csv(source)
+          required = {'symbol','asof','status','close','box_top','box_bottom'}
+          if not required.issubset(df.columns) or len(df) < 20:
+              raise SystemExit(f'Scan incomplete ({len(df)} rows); existing dashboard data preserved')
+          target = Path('v7_1/data/scan_all.csv')
+          target.parent.mkdir(parents=True, exist_ok=True)
+          target.write_bytes(source.read_bytes())
+          print(f'Validated and staged {len(df)} market symbols')
+          PY
+      - name: Commit fresh scan for Render auto-deploy
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add v7_1/data/scan_all.csv
+          if git diff --cached --quiet; then
+            echo "Scan unchanged; no commit required"
+            exit 0
+          fi
+          git commit -m "data: refresh Darvas V7.1 market scan [skip ci]"
+          git pull --rebase origin main
+          git push origin HEAD:main
+      - name: Preserve scan artifact for troubleshooting
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: darvas-v71-market-${{ github.run_number }}
+          path: v6_3/output/scan_all.csv
+          if-no-files-found: ignore
+          retention-days: 14
