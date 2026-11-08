@@ -1,0 +1,33 @@
+name: Darvas V6.2 Weekly Universe
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '15 14 * * 1'
+permissions:
+  contents: write
+jobs:
+  universe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements_v62.txt
+      - run: python darvas_v62.py universe --limit 1500
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: darvas-v62-universe-${{ github.run_id }}
+          path: |
+            symbols_v6_1500.txt
+            darvas_v62_universe_audit.csv
+      - name: Commit successful universe
+        run: |
+          if test -s symbols_v6_1500.txt; then
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git add symbols_v6_1500.txt
+            if ! git diff --cached --quiet; then git commit -m 'chore: refresh V6.2 universe'; git pull --rebase; git push; fi
+          fi
