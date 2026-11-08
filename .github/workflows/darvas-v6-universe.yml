@@ -15,7 +15,7 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r v6_2/requirements_v62.txt
-      - run: python darvas_v62.py universe --limit 1500
+      - run: python v6_2/darvas_v62.py universe --limit 1500
       - uses: actions/upload-artifact@v4
         if: always()
         with:
