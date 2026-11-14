@@ -36,6 +36,8 @@ st.title('📈 Darvas V7.1 | Trading Command Center')
 st.caption('Research and portfolio oversight only • No automatic brokerage execution • V6.3 scan signals are not yet book-certified')
 with st.sidebar:
     st.header('System status')
+    scan_count=int(read(con,'SELECT COUNT(*) AS n FROM signals').iloc[0]['n'])
+    st.caption(f'Market symbols available: {scan_count:,}')
     st.caption(scan_sync_status)
     imports=read(con,'SELECT kind,MAX(imported_at) AS last_import,COUNT(*) AS files FROM imports GROUP BY kind')
     for r in imports.itertuples():st.caption(f'{r.kind}: {r.last_import} UTC')
@@ -52,12 +54,31 @@ status_panel()
 
 tabs=st.tabs(['📊 Dashboard','📤 Schwab & Scan Upload','💼 Portfolio','🎯 Opportunities','📦 Box Explorer','🛡️ Orders & Stops','📜 History'])
 with tabs[0]:
+    st.subheader('Your portfolio: what needs attention?')
     a=actions(con)
-    if a.empty:st.info('Upload Schwab Positions and a V6.3 scan to populate actions.')
+    if a.empty:
+        st.info('No positions imported. Market research is available under Opportunities without Schwab data.')
     else:
+        from decision_ui import enrich_positions
+        enriched=enrich_positions(a)
         log_actions(con,a)
-        st.dataframe(a,use_container_width=True,hide_index=True,on_select='rerun',selection_mode='single-row')
-        st.warning('HOLD / ADD / EXIT classifications are research reviews, not trade orders. Verify current prices, broker orders, and box confirmation.')
+        critical=int((enriched['priority']=='HIGH').sum())
+        missing=int(enriched['approved_stop'].isna().sum())
+        c1,c2,c3=st.columns(3)
+        c1.metric('High-priority reviews',critical)
+        c2.metric('Missing recorded stops',missing)
+        c3.metric('Holdings',len(enriched))
+        for _,r in enriched.sort_values(['priority_rank','symbol']).iterrows():
+            with st.container(border=True):
+                l,m,n=st.columns([1.4,1,1])
+                l.markdown(f'### {r["symbol"]} — {r["decision_label"]}')
+                m.metric('Scan close',f'${r["scan_close"]:,.2f}' if pd.notna(r['scan_close']) else 'N/A')
+                n.metric('Vs. box floor',f'{r["floor_distance_pct"]:+.1f}%' if pd.notna(r['floor_distance_pct']) else 'N/A')
+                st.write(r['decision_explanation'])
+                st.caption(f'As of {r["scan_asof"]} • Cost/share ${r["cost"]:,.2f} • {r["shares"]:g} shares • Approved stop: '+(f'${r["approved_stop"]:,.2f}' if pd.notna(r['approved_stop']) else 'Not recorded'))
+        with st.expander('Detailed portfolio table'):
+            st.dataframe(enriched.drop(columns=['priority_rank']),use_container_width=True,hide_index=True)
+    st.warning('Research only, not trading instructions. Prices are historical snapshots. Verify live quotes, confirmed boxes, fills and protective orders at Schwab before acting.')
 with tabs[1]:
     st.subheader('Import your Schwab and Darvas data')
     st.caption('Private files are stored in the application database, never in GitHub. Review the preview before importing.')
@@ -90,11 +111,20 @@ with tabs[2]:
     st.dataframe(read(con,'SELECT * FROM positions ORDER BY symbol'),use_container_width=True,hide_index=True)
     st.caption('Snapshot positions are not live holdings. Orders may have changed after export.')
 with tabs[3]:
-    st.subheader('Breakout research shortlist')
+    st.subheader('New-stock opportunity research')
+    st.caption('Shortlist uses breakout, liquidity, volume and extension filters. Not a validated BUY signal.')
     d=opportunities(con)
-    if d.empty:st.info('Import V6.3 scan_all.csv to view candidates.')
-    else:st.dataframe(d[['symbol','name','asof','close','box_top','box_bottom','volume_ratio','extension_pct','box_risk_pct','avg_dollar_volume20']],use_container_width=True,hide_index=True)
-    st.caption('Ranking is a modern preliminary filter; it does not certify original-book box confirmation.')
+    if d.empty:
+        st.info('No candidates meet all current filters. This does not mean the scanner failed.')
+    else:
+        from decision_ui import enrich_opportunities
+        ranked=enrich_opportunities(d)
+        st.metric('Candidates passing preliminary filters',len(ranked))
+        max_extension=st.slider('Maximum extension above box top (%)',1.0,5.0,5.0,0.5)
+        min_volume=st.slider('Minimum relative volume',1.5,4.0,1.5,0.25)
+        shown=ranked[(ranked.extension_pct<=max_extension)&(ranked.volume_ratio>=min_volume)]
+        st.dataframe(shown[['symbol','name','asof','close','box_top','box_bottom','volume_ratio','extension_pct','box_risk_pct','research_label','research_note']],use_container_width=True,hide_index=True)
+        st.caption('Candidates are sorted by relative volume, not predicted returns. Historical H1/H2/H3 box confirmation is not yet implemented.')
 with tabs[4]:
     st.subheader('Darvas Box Explorer')
     symbols=read(con,'SELECT symbol FROM signals UNION SELECT symbol FROM positions ORDER BY symbol').symbol.tolist()
