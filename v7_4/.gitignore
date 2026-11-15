@@ -1,0 +1,25 @@
+# Local application data and private portfolio records
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.parquet
+# Secrets
+.env
+.env.*
+!.env.example
+*credentials*
+*secrets*
+# Python / virtual environments
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+# Editor and OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
