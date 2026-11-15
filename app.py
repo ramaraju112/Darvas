@@ -93,11 +93,23 @@ class Alert(BaseModel):
 
 @app.get('/')
 def index(): return FileResponse(ROOT/'static'/'index.html')
+
 @app.get('/api/status')
 def status():
-    return {'mode':'RESEARCH_ONLY','connected_broker':False,'live_feed':False,'telegram_configured':bool(os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')),
-            'symbols':rows('SELECT symbol,COUNT(*) AS bars,MIN(day) AS first_day,MAX(day) AS last_day FROM bars GROUP BY symbol ORDER BY symbol'),
-            'positions':rows('SELECT * FROM positions ORDER BY symbol'),'runs':rows('SELECT * FROM runs ORDER BY id DESC LIMIT 5')}
+    return {
+        'mode': 'RESEARCH_ONLY',
+        'connected_broker': False,
+        'live_feed': False,
+        'telegram_configured': bool(
+            os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')
+        ),
+        'symbols': rows(
+            'SELECT symbol, COUNT(*) AS bars, MIN(day) AS first_day, '
+            'MAX(day) AS last_day FROM bars GROUP BY symbol ORDER BY symbol'
+        ),
+        'positions': rows('SELECT * FROM positions ORDER BY symbol'),
+        'runs': rows('SELECT * FROM runs ORDER BY id DESC LIMIT 5')
+    }
 @app.post('/api/download')
 def download(req:Download):
     if req.period not in ('1y','2y','5y','10y','max'): raise HTTPException(400,'Invalid period')
