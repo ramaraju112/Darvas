@@ -361,3 +361,16 @@ def test_oracle_storage():
             'error_type': type(exc).__name__,
             'message': 'Oracle test failed. Check Render logs privately and verify OCI credentials and bucket permissions.',
         }) from None
+
+@app.get('/api/storage/status')
+def storage_status():
+    """Non-secret local database and Oracle backup/restore status."""
+    return {
+        'oracle_restore': STORAGE_STATE['restore'],
+        'oracle_backup': STORAGE_STATE['backup'],
+        'database_exists': DB.exists(),
+        'database_size_bytes': DB.stat().st_size if DB.exists() else 0,
+        'stored_symbols': len(rows('SELECT DISTINCT symbol FROM bars')),
+        'snapshot_object': ORACLE_DB_OBJECT,
+        'note': 'Backup status reflects this running process; it does not independently verify remote snapshot contents.'
+    }
