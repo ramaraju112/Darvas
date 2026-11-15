@@ -178,11 +178,20 @@ async def portfolio_import(file:UploadFile=File(...)):
             if horizon not in ('swing','position','long-term'): horizon='position'
             data.append((s,q,cb,horizon,norm.get('thesis','')[:2000]))
         if not data: raise ValueError('No positions found')
+    except (ValueError, UnicodeError, csv.Error, KeyError, TypeError) as e:
+        raise HTTPException(400, str(e)) from None
+    if not LOCK.acquire(blocking=False):
+        raise HTTPException(409, 'Another database update is running; please retry')
+    try:
         with closing(conn()) as c:
             c.execute('DELETE FROM positions')
-            c.executemany('INSERT INTO positions(symbol,quantity,cost_basis,horizon,thesis) VALUES(?,?,?,?,?)',data);c.commit()
-        return {'imported':len(data),'note':'Replaces local positions. CSV is stored as parsed positions, not uploaded file. No brokerage connection or order verification.'}
-    except Exception as e: raise HTTPException(400,str(e))
+            c.executemany('INSERT INTO positions(symbol,quantity,cost_basis,horizon,thesis) VALUES(?,?,?,?,?)',data)
+            c.commit()
+        backup_after_change()
+        return {'imported':len(data), 'oracle_backup':'ok',
+                'note':'Replaces saved positions; no brokerage connection or order verification.'}
+    finally:
+        LOCK.release()
 @app.get('/api/portfolio')
 def portfolio():
     out=[]
@@ -199,9 +208,17 @@ def getnote(symbol:str): return {'symbol':clean_symbol(symbol),'note':(rows('SEL
 @app.post('/api/notes')
 def putnote(note:Note):
     s=clean_symbol(note.symbol)
-    with closing(conn()) as c:
-        c.execute('INSERT OR REPLACE INTO notes(symbol,text,updated) VALUES(?,?,?)',(s,note.text[:10000],datetime.now(timezone.utc).isoformat()));c.commit()
-    return {'saved':True}
+    if not LOCK.acquire(blocking=False):
+        raise HTTPException(409, 'Another database update is running; please retry')
+    try:
+        with closing(conn()) as c:
+            c.execute('INSERT OR REPLACE INTO notes(symbol,text,updated) VALUES(?,?,?)',
+                      (s,note.text[:10000],datetime.now(timezone.utc).isoformat()))
+            c.commit()
+        backup_after_change()
+        return {'saved':True, 'oracle_backup':'ok'}
+    finally:
+        LOCK.release()
 @app.get('/api/research/{symbol}')
 def research(symbol:str):
     s=clean_symbol(symbol); sig=signal(s); return {'symbol':s,'signal':sig,'brief':f'Research {s} with current cited sources. Analyze earnings, debt, cash flow, SEC filings, catalysts, risks, bull/bear cases, Darvas and early recovery. Historical local screen: {json.dumps(sig)}. This is not a verified trading signal.'}
@@ -216,9 +233,18 @@ def test_alert(a:Alert):
         resp=requests.post(f'https://api.telegram.org/bot{token}/sendMessage',json={'chat_id':chat,'text':message},timeout=12)
         resp.raise_for_status(); ok=bool(resp.json().get('ok'))
     except Exception as e: raise HTTPException(502,f'Telegram API error: {str(e)[:160]}')
-    with closing(conn()) as c:
-        c.execute('INSERT INTO alerts(created,symbol,severity,message,delivered) VALUES(?,?,?,?,?)',(datetime.now(timezone.utc).isoformat(),s,a.severity,message,int(ok)));c.commit()
-    return {'telegram_api_accepted':ok,'phone_received':'NOT_VERIFIED'}
+    if not LOCK.acquire(blocking=False):
+        raise HTTPException(409, 'Another database update is running; please retry')
+    try:
+        with closing(conn()) as c:
+            c.execute('INSERT INTO alerts(created,symbol,severity,message,delivered) VALUES(?,?,?,?,?)',
+                      (datetime.now(timezone.utc).isoformat(),s,a.severity,message,int(ok)))
+            c.commit()
+        backup_after_change()
+        return {'telegram_api_accepted':ok,'phone_received':'NOT_VERIFIED',
+                'oracle_backup':'ok'}
+    finally:
+        LOCK.release()
 @app.get('/api/alerts')
 def alerts(): return {'alerts':rows('SELECT * FROM alerts ORDER BY id DESC LIMIT 100')}
 @app.get('/api/backtest/{symbol}')
@@ -279,6 +305,24 @@ def oracle_backup_database():
                 content_type='application/octet-stream',
             )
     STORAGE_STATE['backup'] = 'ok'
+
+def backup_after_change():
+    """Persist committed changes and clearly report failures without leaking OCI secrets."""
+    try:
+        oracle_backup_database()
+    except Exception:
+        import logging
+        logging.exception('Oracle backup failed after database change')
+        STORAGE_STATE['backup'] = 'failed'
+        raise HTTPException(
+            status_code=503,
+            detail={
+                'local_change_saved': True,
+                'oracle_backup': 'failed',
+                'message': 'Change was saved locally but Oracle backup failed. '
+                           'Check Render logs privately. Do not redeploy until resolved.',
+            },
+        ) from None
 
 def oracle_restore_database():
     import tempfile
@@ -352,7 +396,7 @@ def test_oracle_storage():
         return {
             'connected': True, 'upload': 'ok', 'read': 'ok',
             'delete': 'ok', 'bucket': bucket,
-            'note': 'Connectivity test only; market database backup is handled by /api/download.',
+            'note': 'Connectivity test only; backups follow downloads, portfolio imports, notes and saved alert records.',
         }
     except Exception as exc:
         # Never expose SDK request headers, OCIDs, or private-key material to the browser.
