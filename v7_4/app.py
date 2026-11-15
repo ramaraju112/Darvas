@@ -1,3 +1,4 @@
+
 """Darvas V7.4 integrated browser MVP. Research only, no trading."""
 from pathlib import Path
 from datetime import datetime, timezone
@@ -90,8 +91,11 @@ class Alert(BaseModel):
     symbol:str
     severity:str
     message:str
+
 @app.get('/')
-def index():
-    return FileResponse(ROOT / 'static' / 'index.html')
-@app.get('/api/status')
-def status():
+def index(): return FileResponse(ROOT/'static'/'index.html')
+
+
+
+
+
