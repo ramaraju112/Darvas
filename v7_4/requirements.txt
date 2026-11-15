@@ -5,4 +5,4 @@ yfinance>=0.2.54,<2
 numpy>=1.26,<3
 requests>=2.31,<3
 python-multipart>=0.0.9,<1
-oci>=2.120,<escape><</escape>3
+oci>=2.120,>3
