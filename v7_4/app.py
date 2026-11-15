@@ -141,7 +141,7 @@ private_key = private_key.strip() + '\n'
         'tenancy': os.environ['OCI_TENANCY_OCID'].strip(),
         'fingerprint': os.environ['OCI_FINGERPRINT'].strip(),
         'region': os.environ['OCI_REGION'].strip(),
-        'key_content': private_key + '\n',
+        'key_content': private_key,
     }
     oci.config.validate_config(config)
     return oci.object_storage.ObjectStorageClient(config)
