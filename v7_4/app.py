@@ -30,7 +30,7 @@ def init():
         CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, symbol_count INTEGER, notes TEXT);
         CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, symbol TEXT, severity TEXT, message TEXT, delivered INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS notes(symbol TEXT PRIMARY KEY, text TEXT, updated TEXT);'''); c.commit()
-init()
+# Database initialization runs after the Oracle restore attempt below.
 
 def clean_symbol(s):
     s=str(s).strip().upper()
@@ -135,7 +135,19 @@ def download(req:Download):
             except Exception as e: report.append({'symbol':symbol,'error':str(e)[:200]})
         with closing(conn()) as c:
             c.execute('INSERT INTO runs(created,symbol_count,notes) VALUES(?,?,?)',(datetime.now(timezone.utc).isoformat(),len(symbols),json.dumps(report)));c.commit()
-        return {'report':report,'note':'Unofficial Yahoo source: availability, terms and bulk-download limits apply. This is NOT a complete market feed.'}
+        saved = sum(item.get('saved', 0) for item in report)
+        backup = 'skipped_no_new_bars'
+        if saved:
+            try:
+                oracle_backup_database()
+                backup = 'ok'
+            except Exception:
+                import logging
+                logging.exception('Oracle backup failed after market download')
+                STORAGE_STATE['backup'] = 'failed'
+                backup = 'failed_check_render_logs'
+        return {'report': report, 'oracle_backup': backup,
+                'note': 'Unofficial Yahoo source: availability, terms and bulk-download limits apply. This is NOT a complete market feed.'}
     finally: LOCK.release()
 @app.get('/api/scan')
 def scan():
@@ -247,6 +259,82 @@ def oracle_client():
     return oci.object_storage.ObjectStorageClient(config)
 
 
+# Rolling snapshot: the same object key is overwritten after successful updates.
+# SQLite's backup API makes a transactionally consistent copy even if the DB is in use.
+ORACLE_DB_OBJECT = 'snapshots/darvas.db'
+STORAGE_STATE = {'restore': 'not_attempted', 'backup': 'not_attempted'}
+
+def oracle_backup_database():
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='darvas-snapshot-') as folder:
+        snapshot = Path(folder) / 'darvas.db'
+        with closing(conn()) as source, closing(sqlite3.connect(snapshot)) as target:
+            source.backup(target)
+        with snapshot.open('rb') as stream:
+            oracle_client().put_object(
+                os.environ['OCI_NAMESPACE'].strip(),
+                os.environ['OCI_BUCKET_NAME'].strip(),
+                ORACLE_DB_OBJECT,
+                stream,
+                content_type='application/octet-stream',
+            )
+    STORAGE_STATE['backup'] = 'ok'
+
+def oracle_restore_database():
+    import tempfile
+    import oci
+    # Never overwrite an existing local DB, which could contain newer unsaved data.
+    if DB.exists() and DB.stat().st_size:
+        try:
+            with closing(sqlite3.connect(DB)) as local:
+                count = local.execute('SELECT COUNT(*) FROM bars').fetchone()[0]
+            if count:
+                STORAGE_STATE['restore'] = 'local_database_has_history'
+                return
+        except sqlite3.DatabaseError:
+            # An invalid local file must not be trusted over a valid snapshot.
+            pass
+    try:
+        result = oracle_client().get_object(
+            os.environ['OCI_NAMESPACE'].strip(),
+            os.environ['OCI_BUCKET_NAME'].strip(),
+            ORACLE_DB_OBJECT,
+        )
+    except oci.exceptions.ServiceError as exc:
+        if exc.status == 404:
+            STORAGE_STATE['restore'] = 'no_snapshot_yet'
+            return
+        STORAGE_STATE['restore'] = 'failed'
+        raise
+    with tempfile.NamedTemporaryFile(dir=DATA, suffix='.db', delete=False) as temp:
+        temporary_path = Path(temp.name)
+    try:
+        with temporary_path.open('wb') as output:
+            for chunk in result.data.raw.stream(1024 * 1024, decode_content=False):
+                output.write(chunk)
+        with closing(sqlite3.connect(temporary_path)) as check:
+            integrity = check.execute('PRAGMA integrity_check').fetchone()[0]
+            if integrity != 'ok':
+                raise RuntimeError('Oracle snapshot failed SQLite integrity check')
+            table_names = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'bars' not in table_names:
+                raise RuntimeError('Oracle snapshot has no bars table')
+        os.replace(temporary_path, DB)
+        STORAGE_STATE['restore'] = 'ok'
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+# Restore before the first local DB is created. Fail closed if a remote snapshot
+# exists but cannot be fetched, to avoid overwriting it with an empty database.
+try:
+    oracle_restore_database()
+except Exception:
+    import logging
+    logging.exception('Oracle restore failed; refusing to start to protect saved history')
+    raise
+init()
+
+
 @app.post('/api/oci/test')
 def test_oracle_storage():
     import uuid
@@ -264,7 +352,7 @@ def test_oracle_storage():
         return {
             'connected': True, 'upload': 'ok', 'read': 'ok',
             'delete': 'ok', 'bucket': bucket,
-            'note': 'Test only; database backup is not enabled yet.',
+            'note': 'Connectivity test only; market database backup is handled by /api/download.',
         }
     except Exception as exc:
         # Never expose SDK request headers, OCIDs, or private-key material to the browser.
