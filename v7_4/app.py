@@ -90,7 +90,8 @@ class Alert(BaseModel):
     symbol:str
     severity:str
     message:str
-
 @app.get('/')
-def index(): return FileResponse(ROOT/'static'/'index.html')
+def index():
+    return FileResponse(ROOT / 'static' / 'index.html')
 @app.get('/api/status')
+def status():
