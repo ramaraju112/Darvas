@@ -133,7 +133,9 @@ def oracle_client():
     missing = [name for name in required if not os.getenv(name)]
     if missing:
         raise RuntimeError('Missing Render environment variables: ' + ', '.join(missing))
-    private_key = os.environ['OCI_PRIVATE_KEY'].replace('\\n', '\n').strip()
+    private_key = os.environ['OCI_PRIVATE_KEY']
+private_key = private_key.replace('\\r\\n', '\n').replace('\\n', '\n')
+private_key = private_key.strip() + '\n'
     config = {
         'user': os.environ['OCI_USER_OCID'].strip(),
         'tenancy': os.environ['OCI_TENANCY_OCID'].strip(),
