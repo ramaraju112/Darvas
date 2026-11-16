@@ -59,26 +59,67 @@ def indicators(df):
     d['ret20']=c/c.shift(20)-1
     return d
 
+def classic_darvas_engine(d):
+    """Provisional breakout watch, separate from Early Recovery. NOT classic confirmed pivots."""
+    last=d.iloc[-1]; price=float(last['close'])
+    prior_high=float(d.high.iloc[-21:-1].max())
+    base=d.iloc[-20:]; high=float(base.high.max()); low=float(base.low.min())
+    depth=(high-low)/max(high,0.01)
+    watch=price>=prior_high and depth<=0.15
+    return {'watch':bool(watch),'stage':'BREAKOUT_WATCH' if watch else 'NONE',
+            'base_depth_pct':round(depth*100,2),'prior_high':round(prior_high,3),
+            'reason':'Provisional 20-session breakout and depth heuristic; confirmed Darvas boxes/pivots not implemented'}
+
+def early_recovery_engine(d):
+    """Independent early-recovery research discovery; no Darvas box/depth condition."""
+    last=d.iloc[-1]; price=float(last['close']); base=d.iloc[-20:]
+    prev=d.iloc[-140:-20] if len(d)>=140 else d.iloc[:-20]
+    reference_high=float(prev.high.max()) if len(prev) else price
+    low=float(base.low.min())
+    decline=(reference_high-low)/max(reference_high,0.01)
+    hma=float(last.hma38) if pd.notna(last.hma38) else None
+    slope=float(last.hma_slope3) if pd.notna(last.hma_slope3) else None
+    rvol=float(last.rvol20) if pd.notna(last.rvol20) else None
+    # Discovery is deliberately broader than a trade-ready watch.
+    discovery=decline>=0.20 and slope is not None and slope>0 and hma is not None and price>hma
+    watch=discovery and rvol is not None and rvol>=1.0
+    stage='RECOVERY_WATCH' if watch else 'DISCOVERY' if discovery else 'NONE'
+    reasons=[]
+    if decline<0.20: reasons.append('Prior decline below exploratory 20% discovery threshold')
+    if slope is None or slope<=0: reasons.append('HMA slope not positive')
+    if hma is None or price<=hma: reasons.append('Price not above HMA38')
+    if discovery and not watch: reasons.append('RVOL below exploratory 1.0 watch threshold')
+    if watch: reasons.append('Recovery discovery with volume confirmation; not an entry signal')
+    return {'discovery':bool(discovery),'watch':bool(watch),'stage':stage,
+            'prior_decline_pct':round(decline*100,2),'reasons':reasons,
+            'reason':'Independent provisional recovery discovery; no Darvas box requirement'}
+
 def signal(symbol):
     df=history(symbol)
-    if len(df)<65: return {'symbol':symbol,'status':'DATA_INCOMPLETE','bars':len(df),'reason':'At least 65 daily bars required for screening'}
-    d=indicators(df); last=d.iloc[-1]; base=d.iloc[-20:]; price=float(last['close']); lo=float(base.low.min()); hi=float(base.high.max())
-    depth=(hi-lo)/max(hi,0.01)
-    breakout=price>=float(d.high.iloc[-21:-1].max()) and depth<=.15
-    prev120=d.iloc[-140:-20] if len(d)>=140 else d.iloc[:-20]
-    drawdown=(float(prev120.high.max())-lo)/max(float(prev120.high.max()),0.01) if len(prev120) else 0
-    slope=float(last['hma_slope3']) if pd.notna(last['hma_slope3']) else None
-    recovery=drawdown>=.20 and depth<=.18 and slope is not None and slope>=-.01
-    stage='DEVELOPING_WATCH' if recovery else 'NONE'
-    if breakout: stage='BREAKOUT_WATCH'
-    return {'symbol':symbol,'status':'RESEARCH_ONLY','date':str(last.day),'price':round(price,3),'bars':len(d),
-        'darvas_watch':bool(breakout),'recovery_watch':bool(recovery),'stage':stage,'base_depth_pct':round(depth*100,2),
-        'prior_decline_pct':round(drawdown*100,2),'hma38':round(float(last.hma38),3) if pd.notna(last.hma38) else None,
+    if len(df)<65:
+        return {'symbol':symbol,'status':'DATA_INCOMPLETE','bars':len(df),
+                'darvas_watch':False,'recovery_watch':False,'recovery_discovery':False,
+                'darvas':{'stage':'DATA_INCOMPLETE'},'recovery':{'stage':'DATA_INCOMPLETE'},
+                'reason':'At least 65 daily bars required for screening'}
+    d=indicators(df); last=d.iloc[-1]
+    darvas=classic_darvas_engine(d)
+    recovery=early_recovery_engine(d)
+    slope=float(last.hma_slope3) if pd.notna(last.hma_slope3) else None
+    return {'symbol':symbol,'status':'RESEARCH_ONLY','date':str(last.day),
+        'price':round(float(last['close']),3),'bars':len(d),
+        'darvas_watch':darvas['watch'],'recovery_watch':recovery['watch'],
+        'recovery_discovery':recovery['discovery'],
+        'darvas_stage':darvas['stage'],'recovery_stage':recovery['stage'],
+        'stage':recovery['stage'] if recovery['discovery'] else darvas['stage'],
+        'darvas':darvas,'recovery':recovery,
+        'base_depth_pct':darvas['base_depth_pct'],
+        'prior_decline_pct':recovery['prior_decline_pct'],
+        'hma38':round(float(last.hma38),3) if pd.notna(last.hma38) else None,
         'hma_slope3_pct':round(slope*100,2) if slope is not None else None,
         'atr14':round(float(last.atr14),3) if pd.notna(last.atr14) else None,
         'rvol20':round(float(last.rvol20),2) if pd.notna(last.rvol20) else None,
         'data_age_days':(datetime.now(timezone.utc).date()-pd.Timestamp(last.day).date()).days,
-        'reason':'Simplified screening heuristic; NOT confirmed V7.4 pivots/RS/box validation'}
+        'reason':'Separate provisional Darvas breakout and independent recovery discovery; neither is a verified entry signal'}
 
 class Download(BaseModel):
     symbols:list[str]=DEFAULT
@@ -154,8 +195,10 @@ def scan():
     syms=[r['symbol'] for r in rows('SELECT DISTINCT symbol FROM bars ORDER BY symbol') if r['symbol'] not in ('SPY','QQQ')]
     results=[signal(s) for s in syms]
     darvas=sorted([x for x in results if x.get('darvas_watch')],key=lambda x:(x.get('rvol20') or 0),reverse=True)[:20]
-    recovery=sorted([x for x in results if x.get('recovery_watch')],key=lambda x:(x.get('prior_decline_pct') or 0),reverse=True)
-    return {'scanned':len(syms),'darvas':darvas,'recovery':recovery,'all':results,'disclaimer':'Exploratory heuristics only; full confirmed pivot, relative-strength and historical replay logic is not yet implemented.'}
+    recovery=sorted([x for x in results if x.get('recovery_watch')],key=lambda x:(x.get('rvol20') or 0),reverse=True)
+    discovery=sorted([x for x in results if x.get('recovery_discovery')],key=lambda x:(x.get('hma_slope3_pct') or 0),reverse=True)
+    return {'scanned':len(syms),'darvas':darvas,'recovery':recovery,'recovery_discovery':discovery,
+            'all':results,'disclaimer':'Independent provisional engines. Recovery discovery is NOT an entry signal; confirmed Darvas pivots, relative strength and replay are not implemented.'}
 @app.get('/api/prices/{symbol}')
 def prices(symbol:str):
     symbol=clean_symbol(symbol); d=history(symbol)
