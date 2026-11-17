@@ -1,10 +1,13 @@
-name: Darvas V7.4 — strict 4 PM Central full-market sync
+name: Darvas V7.4 — 4 PM CT (Nov 17 one-day 6 PM exception)
 on:
   schedule:
     # GitHub schedules are UTC. Dual UTC entries account for CST/CDT;
     # the Python runner rejects the out-of-window trigger.
     - cron: '0 21 * * 1-5'
     - cron: '0 22 * * 1-5'
+    # Nov 17 2026 at 6 PM CST is Nov 18 00:00 UTC.
+    # This cron repeats yearly, but the runner rejects it except on Nov 17 2026.
+    - cron: '0 0 18 11 *'
   # Deliberately no workflow_dispatch: no bulk run outside scheduled window.
 permissions:
   contents: read
@@ -20,7 +23,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Scheduled 4 PM Central updater
+      - name: Scheduled Central-time updater
         env:
           DARVAS_APP_URL: https://darvas-v74.onrender.com
           DARVAS_SYNC_TOKEN: ${{ secrets.DARVAS_SYNC_TOKEN }}
