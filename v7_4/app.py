@@ -1,13 +1,15 @@
 """Darvas V7.4 integrated browser MVP. Research only, no trading."""
 from pathlib import Path
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import secrets
 from contextlib import closing
-import csv, io, json, os, sqlite3, threading, time
+import csv, io, json, os, sqlite3, threading, time, re
 import numpy as np
 import pandas as pd
 import requests
 import yfinance as yf
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -30,7 +32,18 @@ def init():
         CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, symbol_count INTEGER, notes TEXT);
         CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, symbol TEXT, severity TEXT, message TEXT, delivered INTEGER DEFAULT 0);
         CREATE TABLE IF NOT EXISTS notes(symbol TEXT PRIMARY KEY, text TEXT, updated TEXT);
-        CREATE TABLE IF NOT EXISTS market_universe(symbol TEXT PRIMARY KEY, exchange TEXT, name TEXT, updated TEXT);'''); c.commit()
+        CREATE TABLE IF NOT EXISTS market_universe(symbol TEXT PRIMARY KEY, exchange TEXT, name TEXT, updated TEXT);
+        CREATE TABLE IF NOT EXISTS sync_log(id INTEGER PRIMARY KEY AUTOINCREMENT, run_day TEXT, batch_offset INTEGER, attempted INTEGER, succeeded INTEGER, errors INTEGER, backup TEXT, created TEXT);
+        CREATE TABLE IF NOT EXISTS screen_cache(symbol TEXT PRIMARY KEY, payload TEXT NOT NULL, updated TEXT NOT NULL);''')
+        existing={r[1] for r in c.execute('PRAGMA table_info(market_universe)')}
+        for col,definition in {
+            'eligible':'INTEGER NOT NULL DEFAULT 0', 'active':'INTEGER NOT NULL DEFAULT 1',
+            'reason':'TEXT', 'last_attempt':'TEXT', 'last_success':'TEXT',
+            'failures':'INTEGER NOT NULL DEFAULT 0', 'last_error':'TEXT'
+        }.items():
+            if col not in existing: c.execute(f'ALTER TABLE market_universe ADD COLUMN {col} {definition}')
+        c.execute('CREATE INDEX IF NOT EXISTS ix_universe_queue ON market_universe(active,eligible,last_attempt)')
+        c.commit()
 # Database initialization runs after the Oracle restore attempt below.
 
 def clean_symbol(s):
@@ -61,15 +74,30 @@ def indicators(df):
     return d
 
 def classic_darvas_engine(d):
-    """Provisional breakout watch, separate from Early Recovery. NOT classic confirmed pivots."""
-    last=d.iloc[-1]; price=float(last['close'])
-    prior_high=float(d.high.iloc[-21:-1].max())
-    base=d.iloc[-20:]; high=float(base.high.max()); low=float(base.low.min())
-    depth=(high-low)/max(high,0.01)
-    watch=price>=prior_high and depth<=0.15
+    """Conservative 20-session breakout *watch*, not a confirmed Darvas box."""
+    last = d.iloc[-1]
+    prior = d.iloc[-21:-1]  # exclude today's bar from reference high AND depth
+    prior_high = float(prior.high.max())
+    prior_low = float(prior.low.min())
+    depth = (prior_high-prior_low)/max(prior_high, 0.01)
+    price = float(last.close)
+    volume = float(last.volume)
+    rvol = float(last.rvol20) if pd.notna(last.rvol20) else None
+    # Avoid falsely classifying new issues, empty volume, and insufficient history.
+    enough_history = len(d) >= 120
+    watch = (enough_history and price > prior_high and depth <= .15
+             and volume > 0 and rvol is not None and rvol >= 1.2)
+    reasons=[]
+    if not enough_history: reasons.append('Less than 120 sessions of price history')
+    if not price > prior_high: reasons.append('Close did not exceed preceding 20-session high')
+    if depth > .15: reasons.append('Prior 20-session range exceeds 15%')
+    if volume <= 0 or rvol is None: reasons.append('Volume missing or zero')
+    elif rvol < 1.2: reasons.append('RVOL below provisional 1.2 threshold')
+    if watch: reasons.append('Provisional breakout watch only; confirmed Darvas pivots not implemented')
     return {'watch':bool(watch),'stage':'BREAKOUT_WATCH' if watch else 'NONE',
             'base_depth_pct':round(depth*100,2),'prior_high':round(prior_high,3),
-            'reason':'Provisional 20-session breakout and depth heuristic; confirmed Darvas boxes/pivots not implemented'}
+            'reasons':reasons,
+            'reason':'Independent provisional breakout watch; confirmed Darvas boxes/pivots not implemented'}
 
 def early_recovery_engine(d):
     """Independent early-recovery research discovery; no Darvas box/depth condition."""
@@ -152,40 +180,72 @@ def status():
         'positions': rows('SELECT * FROM positions ORDER BY symbol'),
         'runs': rows('SELECT * FROM runs ORDER BY id DESC LIMIT 5')
     }
+# Conservative listing filter: only names explicitly identifying ordinary/common equity.
+# Exchange directory metadata is not a comprehensive security master; report unknowns.
+EXCLUDE_NAME = re.compile(r'\b(warrant|warrants|unit|units|right|rights|preferred|preference|\bETF\b|\bETN\b|fund|trust|note|bond|debenture|certificate|subscription|depositary shares? representing preferred)\b', re.I)
+INCLUDE_NAME = re.compile(r'\b(common stock|common shares?|ordinary shares?|ordinary stock|class [a-z] common|american depositary shares?|american depositary receipts?|\bADS\b|\bADR\b)\b', re.I)
+
+def classify_common_equity(symbol, name, etf=False, test=False):
+    name=str(name or '')
+    if etf or test: return False, 'ETF or test issue'
+    if symbol.endswith(('.WS','.WT','.U','.R')): return False, 'non-common symbol suffix'
+    if EXCLUDE_NAME.search(name): return False, 'security name indicates non-common instrument'
+    if INCLUDE_NAME.search(name): return True, 'explicit common/ordinary/ADR description'
+    return False, 'unverified security type (conservative exclusion)'
+
 @app.get('/api/universe')
 def universe(offset:int=0,limit:int=150):
     if offset<0 or not 1<=limit<=150: raise HTTPException(400,'Invalid pagination')
-    total=rows('SELECT COUNT(*) AS n FROM market_universe')[0]['n']
-    entries=rows('SELECT symbol,exchange,name FROM market_universe ORDER BY symbol LIMIT ? OFFSET ?',(limit,offset))
+    total=rows('SELECT COUNT(*) AS n FROM market_universe WHERE active=1 AND eligible=1')[0]['n']
+    entries=rows('SELECT symbol,exchange,name FROM market_universe WHERE active=1 AND eligible=1 ORDER BY symbol LIMIT ? OFFSET ?',(limit,offset))
     return {'total':total,'offset':offset,'limit':limit,'symbols':entries,
-            'note':'Listing directory is not an OHLCV feed. Coverage excludes some security types and is not guaranteed exhaustive.'}
+            'note':'Conservative common/ordinary/ADR candidate universe. Directory classification may omit or misclassify some securities.'}
+
+def update_universe_from_directories():
+    sources=[('NASDAQ','https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt','Symbol','Security Name'),
+             ('OTHER','https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt','ACT Symbol','Security Name')]
+    records=[]; errors=[]; now=datetime.now(timezone.utc).isoformat(); successful=0
+    for exchange,url,symcol,namecol in sources:
+        try:
+            response=requests.get(url,timeout=25,headers={'User-Agent':'Darvas-Research/0.1'})
+            response.raise_for_status()
+            lines=list(csv.DictReader(io.StringIO(response.text),delimiter='|'))
+            count=0
+            for item in lines:
+                symbol=(item.get(symcol) or '').strip().upper()
+                if not symbol or symbol.startswith('FILE CREATION TIME'): continue
+                try: symbol=clean_symbol(symbol)
+                except ValueError: continue
+                name=(item.get(namecol) or '').strip()[:240]
+                eligible,reason=classify_common_equity(symbol,name,item.get('ETF','N')=='Y',item.get('Test Issue','N')=='Y')
+                records.append((symbol,exchange,name,now,int(eligible),reason));count+=1
+            if count<100: raise ValueError('directory unexpectedly short')
+            successful+=1
+        except Exception as exc:
+            errors.append(exchange+': '+str(exc)[:120])
+            records=[r for r in records if r[1]!=exchange]
+    if not records: raise RuntimeError('Both symbol directories unavailable: '+'; '.join(errors))
+    with closing(conn()) as c:
+        # Only deactivate a source after its fresh directory was downloaded successfully.
+        for exchange in {r[1] for r in records}:
+            c.execute('UPDATE market_universe SET active=0 WHERE exchange=?',(exchange,))
+        c.executemany("""INSERT INTO market_universe(symbol,exchange,name,updated,eligible,reason,active)
+             VALUES(?,?,?,?,?,?,1) ON CONFLICT(symbol) DO UPDATE SET
+             exchange=excluded.exchange,name=excluded.name,updated=excluded.updated,
+             eligible=excluded.eligible,reason=excluded.reason,active=1""",records)
+        c.commit()
+    counts=rows('SELECT COUNT(*) total, SUM(CASE WHEN active=1 AND eligible=1 THEN 1 ELSE 0 END) eligible FROM market_universe')[0]
+    return {'listed':counts['total'],'eligible':counts['eligible'] or 0,'errors':errors,'sources_ok':successful}
 
 @app.post('/api/universe/refresh')
 def refresh_universe():
-    # NASDAQ Trader directory: NASDAQ and other listed exchange securities.
-    # Source availability and permissions may change. Refresh is an explicit manual operation.
-    sources=[('NASDAQ','https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt', 'Symbol','Security Name'),
-             ('OTHER','https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt','ACT Symbol','Security Name')]
-    records=[]; errors=[]; now=datetime.now(timezone.utc).isoformat()
-    for exchange,url,symcol,namecol in sources:
-        try:
-            r=requests.get(url,timeout=20,headers={'User-Agent':'Darvas-Research/0.1'});r.raise_for_status()
-            for item in csv.DictReader(io.StringIO(r.text),delimiter='|'):
-                s=(item.get(symcol) or '').strip().upper()
-                if not s or s.startswith('FILE CREATION TIME') or item.get('Test Issue','N')=='Y':continue
-                if item.get('ETF','N')=='Y':continue
-                try:s=clean_symbol(s)
-                except ValueError:continue
-                records.append((s,exchange,(item.get(namecol) or '')[:240],now))
-        except Exception as e:errors.append(exchange+': '+str(e)[:160])
-    if not records:raise HTTPException(502,'Universe directory unavailable: '+'; '.join(errors))
-    with closing(conn()) as c:
-        c.executemany('INSERT OR REPLACE INTO market_universe(symbol,exchange,name,updated) VALUES(?,?,?,?)',records)
-        c.commit()
-    # Universe listing is a local cache, not an OCI snapshot until the next successful backup.
-    return {'listed':rows('SELECT COUNT(*) AS n FROM market_universe')[0]['n'],
-            'source_rows':len(records),'errors':errors,
-            'note':'Universe listing refreshed. Use batches of at most 150 for OHLCV. This is not a bulk market-data subscription.'}
+    if not LOCK.acquire(blocking=False): raise HTTPException(409,'Another database update is running')
+    try:
+        try: result=update_universe_from_directories()
+        except RuntimeError as exc: raise HTTPException(502,str(exc)) from None
+        backup_after_change()
+        return {**result,'oracle_backup':'ok'}
+    finally: LOCK.release()
 
 @app.post('/api/download')
 def download(req:Download):
@@ -208,6 +268,7 @@ def download(req:Download):
                     if all(np.isfinite(vals)) and vals[1]>=vals[2] and vals[3]>0: records.append((symbol,dt,*vals))
                 with closing(conn()) as c:
                     c.executemany('INSERT OR REPLACE INTO bars(symbol,day,open,high,low,close,volume) VALUES (?,?,?,?,?,?,?)',records);c.commit()
+                cache_signal(symbol)
                 report.append({'symbol':symbol,'saved':len(records)})
             except Exception as e: report.append({'symbol':symbol,'error':str(e)[:200]})
         with closing(conn()) as c:
@@ -226,15 +287,148 @@ def download(req:Download):
         return {'report': report, 'oracle_backup': backup,
                 'note': 'Unofficial Yahoo source: availability, terms and bulk-download limits apply. This is NOT a complete market feed.'}
     finally: LOCK.release()
+def cache_signal(symbol):
+    """Compute a single symbol after its OHLCV commit; scan reads this precomputed result."""
+    result=signal(symbol)
+    with closing(conn()) as c:
+        c.execute('INSERT OR REPLACE INTO screen_cache(symbol,payload,updated) VALUES(?,?,?)',
+                  (symbol,json.dumps(result,allow_nan=False),datetime.now(timezone.utc).isoformat()))
+        c.commit()
+    return result
+
+def excluded_security(symbol):
+    # Conservative suffix filter. For reliable classification, use exchange security type metadata.
+    entry=rows('SELECT name FROM market_universe WHERE symbol=?',(symbol,))
+    name=(entry[0]['name'] if entry else '').lower()
+    bad=(' warrant', ' warrants', ' unit ', ' units ', ' right ', ' rights ',
+         ' preferred', ' depositary share', ' acquisition corp')
+    return any(term in ' '+name+' ' for term in bad) or symbol.endswith(('.WS','.WT','.U'))
+
+@app.post('/api/stock/refresh/{symbol}')
+def refresh_stock(symbol:str):
+    symbol=clean_symbol(symbol)
+    exists=rows('SELECT 1 FROM bars WHERE symbol=? LIMIT 1',(symbol,))
+    return download(Download(symbols=[symbol],period='1y' if exists else '10y'))
+
+def sync_coverage():
+    return rows("""SELECT COUNT(*) total,
+      SUM(CASE WHEN eligible=1 AND active=1 THEN 1 ELSE 0 END) eligible,
+      SUM(CASE WHEN eligible=1 AND active=1 AND last_success IS NOT NULL THEN 1 ELSE 0 END) ever_downloaded,
+      SUM(CASE WHEN eligible=1 AND active=1 AND last_success IS NULL THEN 1 ELSE 0 END) pending_initial,
+      SUM(CASE WHEN eligible=1 AND active=1 AND failures>0 THEN 1 ELSE 0 END) with_failures
+      FROM market_universe""")[0]
+
+@app.get('/api/sync/status')
+def sync_status():
+    return {'timezone':'America/Chicago','scheduled_hour':'16:00',
+            'coverage':sync_coverage(),
+            'recent_batches':rows('SELECT * FROM sync_log ORDER BY id DESC LIMIT 12'),
+            'note':'Strict 4 PM weekday window, no catch-up; initial full-universe history may take many sessions. Yahoo coverage is not guaranteed.'}
+
+@app.post('/api/sync/batch')
+def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
+    expected=os.getenv('DARVAS_SYNC_TOKEN','')
+    if not expected or not secrets.compare_digest(x_darvas_sync_token,expected):
+        raise HTTPException(403,'Invalid sync token')
+    local=datetime.now(ZoneInfo('America/Chicago'))
+    if local.weekday()>=5 or local.hour!=16:
+        raise HTTPException(409,'Strict 4 PM Central weekday window only')
+    if limit<1 or limit>8: raise HTTPException(400,'Batch limit must be 1-8')
+    if not LOCK.acquire(blocking=False): raise HTTPException(409,'Another database update is running')
+    try:
+        # Refresh exchange listings at most once per local weekday, including first run.
+        latest=rows('SELECT MAX(updated) updated FROM market_universe')[0]['updated']
+        refreshed=None
+        if not latest or latest[:10]!=local.date().isoformat():
+            try: refreshed=update_universe_from_directories()
+            except Exception as exc:
+                if not rows('SELECT 1 FROM market_universe WHERE active=1 AND eligible=1 LIMIT 1'):
+                    raise HTTPException(503,'Universe refresh failed and no cached universe exists') from None
+                refreshed={'warning':'Universe refresh failed; using cached eligible listings'}
+        # A symbol is attempted at most once per local day, avoiding repeated throttling.
+        # Prioritize existing history needing daily updates, then initial 10y backfill.
+        today=local.date().isoformat()
+        batch=rows("""SELECT u.symbol, u.last_success,
+               (SELECT MAX(b.day) FROM bars b WHERE b.symbol=u.symbol) last_day
+               FROM market_universe u
+               WHERE u.active=1 AND u.eligible=1
+                 AND (u.last_attempt IS NULL OR u.last_attempt < ?)
+               ORDER BY CASE WHEN EXISTS(SELECT 1 FROM bars b WHERE b.symbol=u.symbol)
+                             THEN 0 ELSE 1 END,
+                        COALESCE(u.last_attempt,'') ASC, u.symbol ASC LIMIT ?""",(today,limit))
+        if not batch:
+            backup_after_change() if refreshed else None
+            return {'done':True,'coverage':sync_coverage(),'refreshed':refreshed,'attempted':0}
+        report=[]
+        for item in batch:
+            sym=item['symbol'];last_day=item['last_day']
+            try:
+                kwargs={'interval':'1d','auto_adjust':False,'progress':False,'threads':False,'timeout':15}
+                if last_day:
+                    # Small overlap allows revisions of recently published daily bars.
+                    start=(pd.Timestamp(last_day)-pd.Timedelta(days=7)).strftime('%Y-%m-%d')
+                    raw=yf.download(sym,start=start,**kwargs)
+                else:
+                    raw=yf.download(sym,period='10y',**kwargs)
+                if raw.empty: raise ValueError('No OHLCV returned')
+                if isinstance(raw.columns,pd.MultiIndex): raw.columns=raw.columns.get_level_values(0)
+                records=[]
+                for _,r in raw.reset_index().iterrows():
+                    day=pd.Timestamp(r.iloc[0]).strftime('%Y-%m-%d')
+                    vals=[float(r[x]) for x in ('Open','High','Low','Close','Volume')]
+                    if all(np.isfinite(vals)) and vals[1]>=vals[2] and vals[3]>0:
+                        records.append((sym,day,*vals))
+                if not records: raise ValueError('No valid OHLCV records')
+                with closing(conn()) as c:
+                    c.executemany('INSERT OR REPLACE INTO bars(symbol,day,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)',records)
+                    c.execute('UPDATE market_universe SET last_attempt=?,last_success=?,failures=0,last_error=NULL WHERE symbol=?',(today,today,sym))
+                    c.commit()
+                cache_signal(sym)
+                report.append({'symbol':sym,'saved':len(records)})
+            except Exception as exc:
+                with closing(conn()) as c:
+                    c.execute('UPDATE market_universe SET last_attempt=?,failures=failures+1,last_error=? WHERE symbol=?',(today,str(exc)[:150],sym))
+                    c.commit()
+                report.append({'symbol':sym,'error':type(exc).__name__})
+        succeeded=sum('saved' in r for r in report)
+        with closing(conn()) as c:
+            c.execute('INSERT INTO sync_log(run_day,batch_offset,attempted,succeeded,errors,backup,created) VALUES(?,?,?,?,?,?,?)',
+                      (today,0,len(batch),succeeded,len(batch)-succeeded,'pending',datetime.now(timezone.utc).isoformat()))
+            log_id=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+            c.execute('UPDATE sync_log SET backup=? WHERE id=?',('attempted',log_id))
+            c.commit()
+        # Backup before returning, including progress and failed attempts.
+        backup_after_change()
+        remaining=rows('SELECT COUNT(*) n FROM market_universe WHERE active=1 AND eligible=1 AND (last_attempt IS NULL OR last_attempt<?)',(today,))[0]['n']
+        return {'done':remaining==0,'attempted':len(batch),'succeeded':succeeded,
+                'failed':len(batch)-succeeded,'remaining_today':remaining,'coverage':sync_coverage(),
+                'oracle_backup':'ok','refreshed':refreshed,'report':report}
+    finally: LOCK.release()
+
 @app.get('/api/scan')
 def scan():
-    syms=[r['symbol'] for r in rows('SELECT DISTINCT symbol FROM bars ORDER BY symbol') if r['symbol'] not in ('SPY','QQQ')]
-    results=[signal(s) for s in syms]
+    # Cached screening avoids recalculating thousands of 10-year histories on every page view.
+    cached=rows('''SELECT s.symbol,s.payload FROM screen_cache s LEFT JOIN market_universe u ON u.symbol=s.symbol
+                   WHERE u.symbol IS NULL OR (u.active=1 AND u.eligible=1) ORDER BY s.symbol''')
+    results=[]
+    for item in cached:
+        try:
+            if item['symbol'] not in ('SPY','QQQ'):
+                results.append(json.loads(item['payload']))
+        except (ValueError, TypeError): continue
+    # Existing symbols from before this upgrade are lazily cached, bounded per request.
+    uncached=rows("""SELECT DISTINCT b.symbol FROM bars b LEFT JOIN screen_cache s ON s.symbol=b.symbol
+                    WHERE s.symbol IS NULL ORDER BY b.symbol LIMIT 100""")
+    for item in uncached:
+        sym=item['symbol']
+        if sym in ('SPY','QQQ') or excluded_security(sym): continue
+        try: results.append(cache_signal(sym))
+        except Exception: continue
     darvas=sorted([x for x in results if x.get('darvas_watch')],key=lambda x:(x.get('rvol20') or 0),reverse=True)[:20]
     recovery=sorted([x for x in results if x.get('recovery_watch')],key=lambda x:(x.get('rvol20') or 0),reverse=True)
     discovery=sorted([x for x in results if x.get('recovery_discovery')],key=lambda x:(x.get('hma_slope3_pct') or 0),reverse=True)
-    return {'scanned':len(syms),'darvas':darvas,'recovery':recovery,'recovery_discovery':discovery,
-            'all':results,'disclaimer':'Independent provisional engines. Recovery discovery is NOT an entry signal; confirmed Darvas pivots, relative strength and replay are not implemented.'}
+    return {'scanned':len(results),'darvas':darvas,'recovery':recovery,'recovery_discovery':discovery,
+            'all':results[:250],'total_results':len(results),'disclaimer':'Cached independent provisional screens. Data quality, universe completeness and confirmed Darvas pivots are not validated.'}
 @app.get('/api/prices/{symbol}')
 def prices(symbol:str):
     symbol=clean_symbol(symbol); d=history(symbol)
