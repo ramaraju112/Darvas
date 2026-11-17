@@ -24,4 +24,4 @@ jobs:
         env:
           DARVAS_APP_URL: https://darvas-v74.onrender.com
           DARVAS_SYNC_TOKEN: ${{ secrets.DARVAS_SYNC_TOKEN }}
-        run: python v7_4/scripts/daily_sync.py
+        run: python v7_4/Scripts/daily_sync.py
