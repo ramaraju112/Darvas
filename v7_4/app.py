@@ -1,3 +1,4 @@
+
 """Darvas V7.4 integrated browser MVP. Research only, no trading."""
 from pathlib import Path
 from datetime import datetime, timezone
@@ -94,3 +95,4 @@ def classic_darvas_engine(d):
     if volume <= 0 or rvol is None: reasons.append('Volume missing or zero')
     elif rvol < 1.2: reasons.append('RVOL below provisional 1.2 threshold')
     if watch: reasons.append('Provisional breakout watch only; confirmed Darvas pivots not implemented')
+
