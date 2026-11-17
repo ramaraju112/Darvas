@@ -1,6 +1,463 @@
+"""Darvas V7.4 integrated browser MVP. Research only, no trading."""
+from pathlib import Path
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+import secrets
+from contextlib import closing
+import csv, io, json, os, sqlite3, threading, time, re
+import numpy as np
+import pandas as pd
+import requests
+import yfinance as yf
+from fastapi import FastAPI, HTTPException, UploadFile, File, Header
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
+ROOT=Path(__file__).resolve().parent
+DATA=ROOT/'data'; DATA.mkdir(exist_ok=True)
+DB=DATA/'darvas.db'
+DEFAULT=['ORCL','ACN','INTC','NKE','SEZL','MSFT','NVDA','PLTR','AMD','META','AMZN','AVGO','SPY','QQQ']
+LOCK=threading.Lock()
+app=FastAPI(title='Darvas V7.4 — Browser MVP',version='0.1.0')
+app.mount('/static',StaticFiles(directory=ROOT/'static'),name='static')
 
+def conn():
+    c=sqlite3.connect(DB,timeout=30); c.row_factory=sqlite3.Row; return c
 
+def init():
+    with closing(conn()) as c:
+        c.executescript('''CREATE TABLE IF NOT EXISTS bars(symbol TEXT, day TEXT, open REAL, high REAL, low REAL, close REAL, volume REAL, PRIMARY KEY(symbol,day));
+        CREATE TABLE IF NOT EXISTS positions(symbol TEXT PRIMARY KEY, quantity REAL, cost_basis REAL, horizon TEXT DEFAULT 'position', thesis TEXT DEFAULT '');
+        CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, symbol_count INTEGER, notes TEXT);
+        CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, symbol TEXT, severity TEXT, message TEXT, delivered INTEGER DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS notes(symbol TEXT PRIMARY KEY, text TEXT, updated TEXT);
+        CREATE TABLE IF NOT EXISTS market_universe(symbol TEXT PRIMARY KEY, exchange TEXT, name TEXT, updated TEXT);
+        CREATE TABLE IF NOT EXISTS sync_log(id INTEGER PRIMARY KEY AUTOINCREMENT, run_day TEXT, batch_offset INTEGER, attempted INTEGER, succeeded INTEGER, errors INTEGER, backup TEXT, created TEXT);
+        CREATE TABLE IF NOT EXISTS screen_cache(symbol TEXT PRIMARY KEY, payload TEXT NOT NULL, updated TEXT NOT NULL);''')
+        existing={r[1] for r in c.execute('PRAGMA table_info(market_universe)')}
+        for col,definition in {
+            'eligible':'INTEGER NOT NULL DEFAULT 0', 'active':'INTEGER NOT NULL DEFAULT 1',
+            'reason':'TEXT', 'last_attempt':'TEXT', 'last_success':'TEXT',
+            'failures':'INTEGER NOT NULL DEFAULT 0', 'last_error':'TEXT'
+        }.items():
+            if col not in existing: c.execute(f'ALTER TABLE market_universe ADD COLUMN {col} {definition}')
+        c.execute('CREATE INDEX IF NOT EXISTS ix_universe_queue ON market_universe(active,eligible,last_attempt)')
+        c.commit()
+# Database initialization runs after the Oracle restore attempt below.
+
+def clean_symbol(s):
+    s=str(s).strip().upper()
+    if not s or len(s)>16 or any(x not in 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-^' for x in s):
+        raise ValueError('Invalid ticker')
+    return s
+
+def rows(sql,params=()):
+    with closing(conn()) as c: return [dict(r) for r in c.execute(sql,params).fetchall()]
+
+def history(symbol):
+    return pd.DataFrame(rows('SELECT day,open,high,low,close,volume FROM bars WHERE symbol=? ORDER BY day',(symbol,)))
+
+def indicators(df):
+    d=df.copy()
+    if len(d)<45: return d
+    c=d['close'].astype(float); v=d['volume'].astype(float)
+    def wma(s,n): return s.rolling(n).apply(lambda a: np.dot(a,np.arange(1,n+1))*2/(n*(n+1)),raw=True)
+    d['hma38']=wma(2*wma(c,19)-wma(c,38),6)
+    d['hma_slope3']=d['hma38']/d['hma38'].shift(3)-1
+    prev=c.shift(1)
+    tr=pd.concat([d.high-d.low,(d.high-prev).abs(),(d.low-prev).abs()],axis=1).max(axis=1)
+    d['atr14']=tr.ewm(alpha=1/14,adjust=False,min_periods=14).mean()
+    d['rvol20']=v/v.shift(1).rolling(20).mean()
+    d['addv20']=(c*v).rolling(20).mean()
+    d['ret20']=c/c.shift(20)-1
+    return d
+
+def classic_darvas_engine(d):
+    """Conservative 20-session breakout *watch*, not a confirmed Darvas box."""
+    last = d.iloc[-1]
+    prior = d.iloc[-21:-1]  # exclude today's bar from reference high AND depth
+    prior_high = float(prior.high.max())
+    prior_low = float(prior.low.min())
+    depth = (prior_high-prior_low)/max(prior_high, 0.01)
+    price = float(last.close)
+    volume = float(last.volume)
+    rvol = float(last.rvol20) if pd.notna(last.rvol20) else None
+    # Avoid falsely classifying new issues, empty volume, and insufficient history.
+    enough_history = len(d) >= 120
+    watch = (enough_history and price > prior_high and depth <= .15
+             and volume > 0 and rvol is not None and rvol >= 1.2)
+    reasons=[]
+    if not enough_history: reasons.append('Less than 120 sessions of price history')
+    if not price > prior_high: reasons.append('Close did not exceed preceding 20-session high')
+    if depth > .15: reasons.append('Prior 20-session range exceeds 15%')
+    if volume <= 0 or rvol is None: reasons.append('Volume missing or zero')
+    elif rvol < 1.2: reasons.append('RVOL below provisional 1.2 threshold')
+    if watch: reasons.append('Provisional breakout watch only; confirmed Darvas pivots not implemented')
+    return {'watch':bool(watch),'stage':'BREAKOUT_WATCH' if watch else 'NONE',
+            'base_depth_pct':round(depth*100,2),'prior_high':round(prior_high,3),
+            'reasons':reasons,
+            'reason':'Independent provisional breakout watch; confirmed Darvas boxes/pivots not implemented'}
+
+def early_recovery_engine(d):
+    """Independent early-recovery research discovery; no Darvas box/depth condition."""
+    last=d.iloc[-1]; price=float(last['close']); base=d.iloc[-20:]
+    prev=d.iloc[-140:-20] if len(d)>=140 else d.iloc[:-20]
+    reference_high=float(prev.high.max()) if len(prev) else price
+    low=float(base.low.min())
+    decline=(reference_high-low)/max(reference_high,0.01)
+    hma=float(last.hma38) if pd.notna(last.hma38) else None
+    slope=float(last.hma_slope3) if pd.notna(last.hma_slope3) else None
+    rvol=float(last.rvol20) if pd.notna(last.rvol20) else None
+    # Discovery is deliberately broader than a trade-ready watch.
+    discovery=decline>=0.20 and slope is not None and slope>0 and hma is not None and price>hma
+    watch=discovery and rvol is not None and rvol>=1.0
+    stage='RECOVERY_WATCH' if watch else 'DISCOVERY' if discovery else 'NONE'
+    reasons=[]
+    if decline<0.20: reasons.append('Prior decline below exploratory 20% discovery threshold')
+    if slope is None or slope<=0: reasons.append('HMA slope not positive')
+    if hma is None or price<=hma: reasons.append('Price not above HMA38')
+    if discovery and not watch: reasons.append('RVOL below exploratory 1.0 watch threshold')
+    if watch: reasons.append('Recovery discovery with volume confirmation; not an entry signal')
+    return {'discovery':bool(discovery),'watch':bool(watch),'stage':stage,
+            'prior_decline_pct':round(decline*100,2),'reasons':reasons,
+            'reason':'Independent provisional recovery discovery; no Darvas box requirement'}
+
+def signal(symbol):
+    df=history(symbol)
+    if len(df)<65:
+        return {'symbol':symbol,'status':'DATA_INCOMPLETE','bars':len(df),
+                'darvas_watch':False,'recovery_watch':False,'recovery_discovery':False,
+                'darvas':{'stage':'DATA_INCOMPLETE'},'recovery':{'stage':'DATA_INCOMPLETE'},
+                'reason':'At least 65 daily bars required for screening'}
+    d=indicators(df); last=d.iloc[-1]
+    darvas=classic_darvas_engine(d)
+    recovery=early_recovery_engine(d)
+    slope=float(last.hma_slope3) if pd.notna(last.hma_slope3) else None
+    return {'symbol':symbol,'status':'RESEARCH_ONLY','date':str(last.day),
+        'price':round(float(last['close']),3),'bars':len(d),
+        'darvas_watch':darvas['watch'],'recovery_watch':recovery['watch'],
+        'recovery_discovery':recovery['discovery'],
+        'darvas_stage':darvas['stage'],'recovery_stage':recovery['stage'],
+        'stage':recovery['stage'] if recovery['discovery'] else darvas['stage'],
+        'darvas':darvas,'recovery':recovery,
+        'base_depth_pct':darvas['base_depth_pct'],
+        'prior_decline_pct':recovery['prior_decline_pct'],
+        'hma38':round(float(last.hma38),3) if pd.notna(last.hma38) else None,
+        'hma_slope3_pct':round(slope*100,2) if slope is not None else None,
+        'atr14':round(float(last.atr14),3) if pd.notna(last.atr14) else None,
+        'rvol20':round(float(last.rvol20),2) if pd.notna(last.rvol20) else None,
+        'data_age_days':(datetime.now(timezone.utc).date()-pd.Timestamp(last.day).date()).days,
+        'reason':'Separate provisional Darvas breakout and independent recovery discovery; neither is a verified entry signal'}
+
+class Download(BaseModel):
+    symbols:list[str]=DEFAULT
+    period:str='10y'
+class Note(BaseModel):
+    symbol:str
+    text:str
+class Alert(BaseModel):
+    symbol:str
+    severity:str
+    message:str
+
+@app.get('/')
+def index(): return FileResponse(ROOT/'static'/'index.html')
+
+# Lightweight readiness endpoints. Never fetch market data or modify SQLite/OCI.
+@app.head('/')
+def head_root():
+    from fastapi import Response
+    return Response(status_code=200)
+
+@app.get('/health')
+def health():
+    return {'status': 'ok', 'application': 'Darvas V7.4'}
+
+@app.head('/health')
+def head_health():
+    from fastapi import Response
+    return Response(status_code=200)
+
+@app.get('/api/status')
+def status():
+    return {
+        'mode': 'RESEARCH_ONLY',
+        'connected_broker': False,
+        'live_feed': False,
+        'telegram_configured': bool(
+            os.getenv('TELEGRAM_BOT_TOKEN') and os.getenv('TELEGRAM_CHAT_ID')
+        ),
+        'symbols': rows(
+            'SELECT symbol, COUNT(*) AS bars, MIN(day) AS first_day, '
+            'MAX(day) AS last_day FROM bars GROUP BY symbol ORDER BY symbol'
+        ),
+        'positions': rows('SELECT * FROM positions ORDER BY symbol'),
+        'runs': rows('SELECT * FROM runs ORDER BY id DESC LIMIT 5')
+    }
+# Conservative listing filter: only names explicitly identifying ordinary/common equity.
+# Exchange directory metadata is not a comprehensive security master; report unknowns.
+EXCLUDE_NAME = re.compile(r'\b(warrant|warrants|unit|units|right|rights|preferred|preference|\bETF\b|\bETN\b|fund|trust|note|bond|debenture|certificate|subscription|depositary shares? representing preferred)\b', re.I)
+INCLUDE_NAME = re.compile(r'\b(common stock|common shares?|ordinary shares?|ordinary stock|class [a-z] common|american depositary shares?|american depositary receipts?|\bADS\b|\bADR\b)\b', re.I)
+
+def classify_common_equity(symbol, name, etf=False, test=False):
+    name=str(name or '')
+    if etf or test: return False, 'ETF or test issue'
+    if symbol.endswith(('.WS','.WT','.U','.R')): return False, 'non-common symbol suffix'
+    if EXCLUDE_NAME.search(name): return False, 'security name indicates non-common instrument'
+    if INCLUDE_NAME.search(name): return True, 'explicit common/ordinary/ADR description'
+    return False, 'unverified security type (conservative exclusion)'
+
+@app.get('/api/universe')
+def universe(offset:int=0,limit:int=150):
+    if offset<0 or not 1<=limit<=150: raise HTTPException(400,'Invalid pagination')
+    total=rows('SELECT COUNT(*) AS n FROM market_universe WHERE active=1 AND eligible=1')[0]['n']
+    entries=rows('SELECT symbol,exchange,name FROM market_universe WHERE active=1 AND eligible=1 ORDER BY symbol LIMIT ? OFFSET ?',(limit,offset))
+    return {'total':total,'offset':offset,'limit':limit,'symbols':entries,
+            'note':'Conservative common/ordinary/ADR candidate universe. Directory classification may omit or misclassify some securities.'}
+
+def update_universe_from_directories():
+    sources=[('NASDAQ','https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt','Symbol','Security Name'),
+             ('OTHER','https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt','ACT Symbol','Security Name')]
+    records=[]; errors=[]; now=datetime.now(timezone.utc).isoformat(); successful=0
+    for exchange,url,symcol,namecol in sources:
+        try:
+            response=requests.get(url,timeout=25,headers={'User-Agent':'Darvas-Research/0.1'})
+            response.raise_for_status()
+            lines=list(csv.DictReader(io.StringIO(response.text),delimiter='|'))
+            count=0
+            for item in lines:
+                symbol=(item.get(symcol) or '').strip().upper()
+                if not symbol or symbol.startswith('FILE CREATION TIME'): continue
+                try: symbol=clean_symbol(symbol)
+                except ValueError: continue
+                name=(item.get(namecol) or '').strip()[:240]
+                eligible,reason=classify_common_equity(symbol,name,item.get('ETF','N')=='Y',item.get('Test Issue','N')=='Y')
+                records.append((symbol,exchange,name,now,int(eligible),reason));count+=1
+            if count<100: raise ValueError('directory unexpectedly short')
+            successful+=1
+        except Exception as exc:
+            errors.append(exchange+': '+str(exc)[:120])
+            records=[r for r in records if r[1]!=exchange]
+    if not records: raise RuntimeError('Both symbol directories unavailable: '+'; '.join(errors))
+    with closing(conn()) as c:
+        # Only deactivate a source after its fresh directory was downloaded successfully.
+        for exchange in {r[1] for r in records}:
+            c.execute('UPDATE market_universe SET active=0 WHERE exchange=?',(exchange,))
+        c.executemany("""INSERT INTO market_universe(symbol,exchange,name,updated,eligible,reason,active)
+             VALUES(?,?,?,?,?,?,1) ON CONFLICT(symbol) DO UPDATE SET
+             exchange=excluded.exchange,name=excluded.name,updated=excluded.updated,
+             eligible=excluded.eligible,reason=excluded.reason,active=1""",records)
+        c.commit()
+    counts=rows('SELECT COUNT(*) total, SUM(CASE WHEN active=1 AND eligible=1 THEN 1 ELSE 0 END) eligible FROM market_universe')[0]
+    return {'listed':counts['total'],'eligible':counts['eligible'] or 0,'errors':errors,'sources_ok':successful}
+
+@app.post('/api/universe/refresh')
+def refresh_universe():
+    if not LOCK.acquire(blocking=False): raise HTTPException(409,'Another database update is running')
+    try:
+        try: result=update_universe_from_directories()
+        except RuntimeError as exc: raise HTTPException(502,str(exc)) from None
+        backup_after_change()
+        return {**result,'oracle_backup':'ok'}
+    finally: LOCK.release()
+
+@app.post('/api/download')
+def download(req:Download):
+    if req.period not in ('1y','2y','5y','10y','max'): raise HTTPException(400,'Invalid period')
+    symbols=list(dict.fromkeys(clean_symbol(s) for s in req.symbols))
+    if len(symbols)>150: raise HTTPException(400,'Maximum 150 tickers per request; use multiple batches')
+    if not LOCK.acquire(blocking=False): raise HTTPException(409,'Another download is running')
+    try:
+        report=[]
+        for symbol in symbols:
+            try:
+                raw=yf.download(symbol,period=req.period,interval='1d',auto_adjust=False,progress=False,threads=False,timeout=15)
+                if raw.empty: raise ValueError('No price data returned')
+                if isinstance(raw.columns,pd.MultiIndex): raw.columns=raw.columns.get_level_values(0)
+                raw=raw.reset_index()
+                records=[]
+                for _,r in raw.iterrows():
+                    dt=pd.Timestamp(r.iloc[0]).strftime('%Y-%m-%d')
+                    vals=[float(r[x]) for x in ['Open','High','Low','Close','Volume']]
+                    if all(np.isfinite(vals)) and vals[1]>=vals[2] and vals[3]>0: records.append((symbol,dt,*vals))
+                with closing(conn()) as c:
+                    c.executemany('INSERT OR REPLACE INTO bars(symbol,day,open,high,low,close,volume) VALUES (?,?,?,?,?,?,?)',records);c.commit()
+                cache_signal(symbol)
+                report.append({'symbol':symbol,'saved':len(records)})
+            except Exception as e: report.append({'symbol':symbol,'error':str(e)[:200]})
+        with closing(conn()) as c:
+            c.execute('INSERT INTO runs(created,symbol_count,notes) VALUES(?,?,?)',(datetime.now(timezone.utc).isoformat(),len(symbols),json.dumps(report)));c.commit()
+        saved = sum(item.get('saved', 0) for item in report)
+        backup = 'skipped_no_new_bars'
+        if saved:
+            try:
+                oracle_backup_database()
+                backup = 'ok'
+            except Exception:
+                import logging
+                logging.exception('Oracle backup failed after market download')
+                STORAGE_STATE['backup'] = 'failed'
+                backup = 'failed_check_render_logs'
+        return {'report': report, 'oracle_backup': backup,
+                'note': 'Unofficial Yahoo source: availability, terms and bulk-download limits apply. This is NOT a complete market feed.'}
+    finally: LOCK.release()
+def cache_signal(symbol):
+    """Compute a single symbol after its OHLCV commit; scan reads this precomputed result."""
+    result=signal(symbol)
+    with closing(conn()) as c:
+        c.execute('INSERT OR REPLACE INTO screen_cache(symbol,payload,updated) VALUES(?,?,?)',
+                  (symbol,json.dumps(result,allow_nan=False),datetime.now(timezone.utc).isoformat()))
+        c.commit()
+    return result
+
+def excluded_security(symbol):
+    # Conservative suffix filter. For reliable classification, use exchange security type metadata.
+    entry=rows('SELECT name FROM market_universe WHERE symbol=?',(symbol,))
+    name=(entry[0]['name'] if entry else '').lower()
+    bad=(' warrant', ' warrants', ' unit ', ' units ', ' right ', ' rights ',
+         ' preferred', ' depositary share', ' acquisition corp')
+    return any(term in ' '+name+' ' for term in bad) or symbol.endswith(('.WS','.WT','.U'))
+
+@app.post('/api/stock/refresh/{symbol}')
+def refresh_stock(symbol:str):
+    symbol=clean_symbol(symbol)
+    exists=rows('SELECT 1 FROM bars WHERE symbol=? LIMIT 1',(symbol,))
+    return download(Download(symbols=[symbol],period='1y' if exists else '10y'))
+
+def sync_coverage():
+    return rows("""SELECT COUNT(*) total,
+      SUM(CASE WHEN eligible=1 AND active=1 THEN 1 ELSE 0 END) eligible,
+      SUM(CASE WHEN eligible=1 AND active=1 AND last_success IS NOT NULL THEN 1 ELSE 0 END) ever_downloaded,
+      SUM(CASE WHEN eligible=1 AND active=1 AND last_success IS NULL THEN 1 ELSE 0 END) pending_initial,
+      SUM(CASE WHEN eligible=1 AND active=1 AND failures>0 THEN 1 ELSE 0 END) with_failures
+      FROM market_universe""")[0]
+
+@app.get('/api/sync/status')
+def sync_status():
+    return {'timezone':'America/Chicago','scheduled_hour':'16:00',
+            'coverage':sync_coverage(),
+            'recent_batches':rows('SELECT * FROM sync_log ORDER BY id DESC LIMIT 12'),
+            'note':'Strict 4 PM weekday window, no catch-up; initial full-universe history may take many sessions. Yahoo coverage is not guaranteed.'}
+
+@app.post('/api/sync/batch')
+def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
+    expected=os.getenv('DARVAS_SYNC_TOKEN','')
+    if not expected or not secrets.compare_digest(x_darvas_sync_token,expected):
+        raise HTTPException(403,'Invalid sync token')
+    local=datetime.now(ZoneInfo('America/Chicago'))
+    if local.weekday()>=5 or local.hour!=16:
+        raise HTTPException(409,'Strict 4 PM Central weekday window only')
+    if limit<1 or limit>8: raise HTTPException(400,'Batch limit must be 1-8')
+    if not LOCK.acquire(blocking=False): raise HTTPException(409,'Another database update is running')
+    try:
+        # Refresh exchange listings at most once per local weekday, including first run.
+        latest=rows('SELECT MAX(updated) updated FROM market_universe')[0]['updated']
+        refreshed=None
+        if not latest or latest[:10]!=local.date().isoformat():
+            try: refreshed=update_universe_from_directories()
+            except Exception as exc:
+                if not rows('SELECT 1 FROM market_universe WHERE active=1 AND eligible=1 LIMIT 1'):
+                    raise HTTPException(503,'Universe refresh failed and no cached universe exists') from None
+                refreshed={'warning':'Universe refresh failed; using cached eligible listings'}
+        # A symbol is attempted at most once per local day, avoiding repeated throttling.
+        # Prioritize existing history needing daily updates, then initial 10y backfill.
+        today=local.date().isoformat()
+        batch=rows("""SELECT u.symbol, u.last_success,
+               (SELECT MAX(b.day) FROM bars b WHERE b.symbol=u.symbol) last_day
+               FROM market_universe u
+               WHERE u.active=1 AND u.eligible=1
+                 AND (u.last_attempt IS NULL OR u.last_attempt < ?)
+               ORDER BY CASE WHEN EXISTS(SELECT 1 FROM bars b WHERE b.symbol=u.symbol)
+                             THEN 0 ELSE 1 END,
+                        COALESCE(u.last_attempt,'') ASC, u.symbol ASC LIMIT ?""",(today,limit))
+        if not batch:
+            backup_after_change() if refreshed else None
+            return {'done':True,'coverage':sync_coverage(),'refreshed':refreshed,'attempted':0}
+        report=[]
+        for item in batch:
+            sym=item['symbol'];last_day=item['last_day']
+            try:
+                kwargs={'interval':'1d','auto_adjust':False,'progress':False,'threads':False,'timeout':15}
+                if last_day:
+                    # Small overlap allows revisions of recently published daily bars.
+                    start=(pd.Timestamp(last_day)-pd.Timedelta(days=7)).strftime('%Y-%m-%d')
+                    raw=yf.download(sym,start=start,**kwargs)
+                else:
+                    raw=yf.download(sym,period='10y',**kwargs)
+                if raw.empty: raise ValueError('No OHLCV returned')
+                if isinstance(raw.columns,pd.MultiIndex): raw.columns=raw.columns.get_level_values(0)
+                records=[]
+                for _,r in raw.reset_index().iterrows():
+                    day=pd.Timestamp(r.iloc[0]).strftime('%Y-%m-%d')
+                    vals=[float(r[x]) for x in ('Open','High','Low','Close','Volume')]
+                    if all(np.isfinite(vals)) and vals[1]>=vals[2] and vals[3]>0:
+                        records.append((sym,day,*vals))
+                if not records: raise ValueError('No valid OHLCV records')
+                with closing(conn()) as c:
+                    c.executemany('INSERT OR REPLACE INTO bars(symbol,day,open,high,low,close,volume) VALUES(?,?,?,?,?,?,?)',records)
+                    c.execute('UPDATE market_universe SET last_attempt=?,last_success=?,failures=0,last_error=NULL WHERE symbol=?',(today,today,sym))
+                    c.commit()
+                cache_signal(sym)
+                report.append({'symbol':sym,'saved':len(records)})
+            except Exception as exc:
+                with closing(conn()) as c:
+                    c.execute('UPDATE market_universe SET last_attempt=?,failures=failures+1,last_error=? WHERE symbol=?',(today,str(exc)[:150],sym))
+                    c.commit()
+                report.append({'symbol':sym,'error':type(exc).__name__})
+        succeeded=sum('saved' in r for r in report)
+        with closing(conn()) as c:
+            c.execute('INSERT INTO sync_log(run_day,batch_offset,attempted,succeeded,errors,backup,created) VALUES(?,?,?,?,?,?,?)',
+                      (today,0,len(batch),succeeded,len(batch)-succeeded,'pending',datetime.now(timezone.utc).isoformat()))
+            log_id=c.execute('SELECT last_insert_rowid()').fetchone()[0]
+            c.execute('UPDATE sync_log SET backup=? WHERE id=?',('attempted',log_id))
+            c.commit()
+        # Backup before returning, including progress and failed attempts.
+        backup_after_change()
+        remaining=rows('SELECT COUNT(*) n FROM market_universe WHERE active=1 AND eligible=1 AND (last_attempt IS NULL OR last_attempt<?)',(today,))[0]['n']
+        return {'done':remaining==0,'attempted':len(batch),'succeeded':succeeded,
+                'failed':len(batch)-succeeded,'remaining_today':remaining,'coverage':sync_coverage(),
+                'oracle_backup':'ok','refreshed':refreshed,'report':report}
+    finally: LOCK.release()
+
+@app.get('/api/scan')
+def scan():
+    # Cached screening avoids recalculating thousands of 10-year histories on every page view.
+    cached=rows('''SELECT s.symbol,s.payload FROM screen_cache s LEFT JOIN market_universe u ON u.symbol=s.symbol
+                   WHERE u.symbol IS NULL OR (u.active=1 AND u.eligible=1) ORDER BY s.symbol''')
+    results=[]
+    for item in cached:
+        try:
+            if item['symbol'] not in ('SPY','QQQ'):
+                results.append(json.loads(item['payload']))
+        except (ValueError, TypeError): continue
+    # Existing symbols from before this upgrade are lazily cached, bounded per request.
+    uncached=rows("""SELECT DISTINCT b.symbol FROM bars b LEFT JOIN screen_cache s ON s.symbol=b.symbol
+                    WHERE s.symbol IS NULL ORDER BY b.symbol LIMIT 100""")
+    for item in uncached:
+        sym=item['symbol']
+        if sym in ('SPY','QQQ') or excluded_security(sym): continue
+        try: results.append(cache_signal(sym))
+        except Exception: continue
+    darvas=sorted([x for x in results if x.get('darvas_watch')],key=lambda x:(x.get('rvol20') or 0),reverse=True)[:20]
+    recovery=sorted([x for x in results if x.get('recovery_watch')],key=lambda x:(x.get('rvol20') or 0),reverse=True)
+    discovery=sorted([x for x in results if x.get('recovery_discovery')],key=lambda x:(x.get('hma_slope3_pct') or 0),reverse=True)
+    return {'scanned':len(results),'darvas':darvas,'recovery':recovery,'recovery_discovery':discovery,
+            'all':results[:250],'total_results':len(results),'disclaimer':'Cached independent provisional screens. Data quality, universe completeness and confirmed Darvas pivots are not validated.'}
+@app.get('/api/prices/{symbol}')
+def prices(symbol:str):
+    symbol=clean_symbol(symbol); d=history(symbol)
+    return {'symbol':symbol,'bars':d.tail(1000).to_dict(orient='records') if len(d) else []}
+@app.post('/api/portfolio/import')
+async def portfolio_import(file:UploadFile=File(...)):
+    if not file.filename.lower().endswith('.csv'): raise HTTPException(400,'Upload a CSV file')
+    b=await file.read(2_000_001)
+    if len(b)>2_000_000: raise HTTPException(400,'CSV max 2MB')
+    try:
+        text=b.decode('utf-8-sig'); reader=csv.DictReader(io.StringIO(text))
+        data=[]
+        for row in reader:
+            norm={str(k).strip().lower().replace(' ','_'):v for k,v in row.items()}
             s=clean_symbol(norm.get('symbol') or norm.get('ticker') or '')
             q=float(norm.get('quantity') or norm.get('shares') or '')
             cb=float(norm.get('cost_basis') or norm.get('average_cost') or norm.get('cost') or '')
@@ -9,11 +466,20 @@
             if horizon not in ('swing','position','long-term'): horizon='position'
             data.append((s,q,cb,horizon,norm.get('thesis','')[:2000]))
         if not data: raise ValueError('No positions found')
+    except (ValueError, UnicodeError, csv.Error, KeyError, TypeError) as e:
+        raise HTTPException(400, str(e)) from None
+    if not LOCK.acquire(blocking=False):
+        raise HTTPException(409, 'Another database update is running; please retry')
+    try:
         with closing(conn()) as c:
             c.execute('DELETE FROM positions')
-            c.executemany('INSERT INTO positions(symbol,quantity,cost_basis,horizon,thesis) VALUES(?,?,?,?,?)',data);c.commit()
-        return {'imported':len(data),'note':'Replaces local positions. CSV is stored as parsed positions, not uploaded file. No brokerage connection or order verification.'}
-    except Exception as e: raise HTTPException(400,str(e))
+            c.executemany('INSERT INTO positions(symbol,quantity,cost_basis,horizon,thesis) VALUES(?,?,?,?,?)',data)
+            c.commit()
+        backup_after_change()
+        return {'imported':len(data), 'oracle_backup':'ok',
+                'note':'Replaces saved positions; no brokerage connection or order verification.'}
+    finally:
+        LOCK.release()
 @app.get('/api/portfolio')
 def portfolio():
     out=[]
@@ -30,9 +496,17 @@ def getnote(symbol:str): return {'symbol':clean_symbol(symbol),'note':(rows('SEL
 @app.post('/api/notes')
 def putnote(note:Note):
     s=clean_symbol(note.symbol)
-    with closing(conn()) as c:
-        c.execute('INSERT OR REPLACE INTO notes(symbol,text,updated) VALUES(?,?,?)',(s,note.text[:10000],datetime.now(timezone.utc).isoformat()));c.commit()
-    return {'saved':True}
+    if not LOCK.acquire(blocking=False):
+        raise HTTPException(409, 'Another database update is running; please retry')
+    try:
+        with closing(conn()) as c:
+            c.execute('INSERT OR REPLACE INTO notes(symbol,text,updated) VALUES(?,?,?)',
+                      (s,note.text[:10000],datetime.now(timezone.utc).isoformat()))
+            c.commit()
+        backup_after_change()
+        return {'saved':True, 'oracle_backup':'ok'}
+    finally:
+        LOCK.release()
 @app.get('/api/research/{symbol}')
 def research(symbol:str):
     s=clean_symbol(symbol); sig=signal(s); return {'symbol':s,'signal':sig,'brief':f'Research {s} with current cited sources. Analyze earnings, debt, cash flow, SEC filings, catalysts, risks, bull/bear cases, Darvas and early recovery. Historical local screen: {json.dumps(sig)}. This is not a verified trading signal.'}
@@ -47,9 +521,18 @@ def test_alert(a:Alert):
         resp=requests.post(f'https://api.telegram.org/bot{token}/sendMessage',json={'chat_id':chat,'text':message},timeout=12)
         resp.raise_for_status(); ok=bool(resp.json().get('ok'))
     except Exception as e: raise HTTPException(502,f'Telegram API error: {str(e)[:160]}')
-    with closing(conn()) as c:
-        c.execute('INSERT INTO alerts(created,symbol,severity,message,delivered) VALUES(?,?,?,?,?)',(datetime.now(timezone.utc).isoformat(),s,a.severity,message,int(ok)));c.commit()
-    return {'telegram_api_accepted':ok,'phone_received':'NOT_VERIFIED'}
+    if not LOCK.acquire(blocking=False):
+        raise HTTPException(409, 'Another database update is running; please retry')
+    try:
+        with closing(conn()) as c:
+            c.execute('INSERT INTO alerts(created,symbol,severity,message,delivered) VALUES(?,?,?,?,?)',
+                      (datetime.now(timezone.utc).isoformat(),s,a.severity,message,int(ok)))
+            c.commit()
+        backup_after_change()
+        return {'telegram_api_accepted':ok,'phone_received':'NOT_VERIFIED',
+                'oracle_backup':'ok'}
+    finally:
+        LOCK.release()
 @app.get('/api/alerts')
 def alerts(): return {'alerts':rows('SELECT * FROM alerts ORDER BY id DESC LIMIT 100')}
 @app.get('/api/backtest/{symbol}')
@@ -90,6 +573,100 @@ def oracle_client():
     return oci.object_storage.ObjectStorageClient(config)
 
 
+# Rolling snapshot: the same object key is overwritten after successful updates.
+# SQLite's backup API makes a transactionally consistent copy even if the DB is in use.
+ORACLE_DB_OBJECT = 'snapshots/darvas.db'
+STORAGE_STATE = {'restore': 'not_attempted', 'backup': 'not_attempted'}
+
+def oracle_backup_database():
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix='darvas-snapshot-') as folder:
+        snapshot = Path(folder) / 'darvas.db'
+        with closing(conn()) as source, closing(sqlite3.connect(snapshot)) as target:
+            source.backup(target)
+        with snapshot.open('rb') as stream:
+            oracle_client().put_object(
+                os.environ['OCI_NAMESPACE'].strip(),
+                os.environ['OCI_BUCKET_NAME'].strip(),
+                ORACLE_DB_OBJECT,
+                stream,
+                content_type='application/octet-stream',
+            )
+    STORAGE_STATE['backup'] = 'ok'
+
+def backup_after_change():
+    """Persist committed changes and clearly report failures without leaking OCI secrets."""
+    try:
+        oracle_backup_database()
+    except Exception:
+        import logging
+        logging.exception('Oracle backup failed after database change')
+        STORAGE_STATE['backup'] = 'failed'
+        raise HTTPException(
+            status_code=503,
+            detail={
+                'local_change_saved': True,
+                'oracle_backup': 'failed',
+                'message': 'Change was saved locally but Oracle backup failed. '
+                           'Check Render logs privately. Do not redeploy until resolved.',
+            },
+        ) from None
+
+def oracle_restore_database():
+    import tempfile
+    import oci
+    # Never overwrite an existing local DB, which could contain newer unsaved data.
+    if DB.exists() and DB.stat().st_size:
+        try:
+            with closing(sqlite3.connect(DB)) as local:
+                count = local.execute('SELECT COUNT(*) FROM bars').fetchone()[0]
+            if count:
+                STORAGE_STATE['restore'] = 'local_database_has_history'
+                return
+        except sqlite3.DatabaseError:
+            # An invalid local file must not be trusted over a valid snapshot.
+            pass
+    try:
+        result = oracle_client().get_object(
+            os.environ['OCI_NAMESPACE'].strip(),
+            os.environ['OCI_BUCKET_NAME'].strip(),
+            ORACLE_DB_OBJECT,
+        )
+    except oci.exceptions.ServiceError as exc:
+        if exc.status == 404:
+            STORAGE_STATE['restore'] = 'no_snapshot_yet'
+            return
+        STORAGE_STATE['restore'] = 'failed'
+        raise
+    with tempfile.NamedTemporaryFile(dir=DATA, suffix='.db', delete=False) as temp:
+        temporary_path = Path(temp.name)
+    try:
+        with temporary_path.open('wb') as output:
+            for chunk in result.data.raw.stream(1024 * 1024, decode_content=False):
+                output.write(chunk)
+        with closing(sqlite3.connect(temporary_path)) as check:
+            integrity = check.execute('PRAGMA integrity_check').fetchone()[0]
+            if integrity != 'ok':
+                raise RuntimeError('Oracle snapshot failed SQLite integrity check')
+            table_names = {r[0] for r in check.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            if 'bars' not in table_names:
+                raise RuntimeError('Oracle snapshot has no bars table')
+        os.replace(temporary_path, DB)
+        STORAGE_STATE['restore'] = 'ok'
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+# Restore before the first local DB is created. Fail closed if a remote snapshot
+# exists but cannot be fetched, to avoid overwriting it with an empty database.
+try:
+    oracle_restore_database()
+except Exception:
+    import logging
+    logging.exception('Oracle restore failed; refusing to start to protect saved history')
+    raise
+init()
+
+
 @app.post('/api/oci/test')
 def test_oracle_storage():
     import uuid
@@ -107,7 +684,7 @@ def test_oracle_storage():
         return {
             'connected': True, 'upload': 'ok', 'read': 'ok',
             'delete': 'ok', 'bucket': bucket,
-            'note': 'Test only; database backup is not enabled yet.',
+            'note': 'Connectivity test only; backups follow downloads, portfolio imports, notes and saved alert records.',
         }
     except Exception as exc:
         # Never expose SDK request headers, OCIDs, or private-key material to the browser.
@@ -117,7 +694,15 @@ def test_oracle_storage():
             'message': 'Oracle test failed. Check Render logs privately and verify OCI credentials and bucket permissions.',
         }) from None
 
-
-
-
-
+@app.get('/api/storage/status')
+def storage_status():
+    """Non-secret local database and Oracle backup/restore status."""
+    return {
+        'oracle_restore': STORAGE_STATE['restore'],
+        'oracle_backup': STORAGE_STATE['backup'],
+        'database_exists': DB.exists(),
+        'database_size_bytes': DB.stat().st_size if DB.exists() else 0,
+        'stored_symbols': len(rows('SELECT DISTINCT symbol FROM bars')),
+        'snapshot_object': ORACLE_DB_OBJECT,
+        'note': 'Backup status reflects this running process; it does not independently verify remote snapshot contents.'
+    }
