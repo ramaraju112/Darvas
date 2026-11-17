@@ -1,0 +1,27 @@
+name: Darvas V7.4 — strict 4 PM Central full-market sync
+on:
+  schedule:
+    # GitHub schedules are UTC. Dual UTC entries account for CST/CDT;
+    # the Python runner rejects the out-of-window trigger.
+    - cron: '0 21 * * 1-5'
+    - cron: '0 22 * * 1-5'
+  # Deliberately no workflow_dispatch: no bulk run outside scheduled window.
+permissions:
+  contents: read
+concurrency:
+  group: darvas-full-market-sync
+  cancel-in-progress: false
+jobs:
+  daily-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 58
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Scheduled 4 PM Central updater
+        env:
+          DARVAS_APP_URL: https://darvas-v74.onrender.com
+          DARVAS_SYNC_TOKEN: ${{ secrets.DARVAS_SYNC_TOKEN }}
+        run: python v7_4/scripts/daily_sync.py
