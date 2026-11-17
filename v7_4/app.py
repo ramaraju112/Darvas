@@ -29,7 +29,8 @@ def init():
         CREATE TABLE IF NOT EXISTS positions(symbol TEXT PRIMARY KEY, quantity REAL, cost_basis REAL, horizon TEXT DEFAULT 'position', thesis TEXT DEFAULT '');
         CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, symbol_count INTEGER, notes TEXT);
         CREATE TABLE IF NOT EXISTS alerts(id INTEGER PRIMARY KEY AUTOINCREMENT, created TEXT, symbol TEXT, severity TEXT, message TEXT, delivered INTEGER DEFAULT 0);
-        CREATE TABLE IF NOT EXISTS notes(symbol TEXT PRIMARY KEY, text TEXT, updated TEXT);'''); c.commit()
+        CREATE TABLE IF NOT EXISTS notes(symbol TEXT PRIMARY KEY, text TEXT, updated TEXT);
+        CREATE TABLE IF NOT EXISTS market_universe(symbol TEXT PRIMARY KEY, exchange TEXT, name TEXT, updated TEXT);'''); c.commit()
 # Database initialization runs after the Oracle restore attempt below.
 
 def clean_symbol(s):
@@ -151,6 +152,41 @@ def status():
         'positions': rows('SELECT * FROM positions ORDER BY symbol'),
         'runs': rows('SELECT * FROM runs ORDER BY id DESC LIMIT 5')
     }
+@app.get('/api/universe')
+def universe(offset:int=0,limit:int=150):
+    if offset<0 or not 1<=limit<=150: raise HTTPException(400,'Invalid pagination')
+    total=rows('SELECT COUNT(*) AS n FROM market_universe')[0]['n']
+    entries=rows('SELECT symbol,exchange,name FROM market_universe ORDER BY symbol LIMIT ? OFFSET ?',(limit,offset))
+    return {'total':total,'offset':offset,'limit':limit,'symbols':entries,
+            'note':'Listing directory is not an OHLCV feed. Coverage excludes some security types and is not guaranteed exhaustive.'}
+
+@app.post('/api/universe/refresh')
+def refresh_universe():
+    # NASDAQ Trader directory: NASDAQ and other listed exchange securities.
+    # Source availability and permissions may change. Refresh is an explicit manual operation.
+    sources=[('NASDAQ','https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt', 'Symbol','Security Name'),
+             ('OTHER','https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt','ACT Symbol','Security Name')]
+    records=[]; errors=[]; now=datetime.now(timezone.utc).isoformat()
+    for exchange,url,symcol,namecol in sources:
+        try:
+            r=requests.get(url,timeout=20,headers={'User-Agent':'Darvas-Research/0.1'});r.raise_for_status()
+            for item in csv.DictReader(io.StringIO(r.text),delimiter='|'):
+                s=(item.get(symcol) or '').strip().upper()
+                if not s or s.startswith('FILE CREATION TIME') or item.get('Test Issue','N')=='Y':continue
+                if item.get('ETF','N')=='Y':continue
+                try:s=clean_symbol(s)
+                except ValueError:continue
+                records.append((s,exchange,(item.get(namecol) or '')[:240],now))
+        except Exception as e:errors.append(exchange+': '+str(e)[:160])
+    if not records:raise HTTPException(502,'Universe directory unavailable: '+'; '.join(errors))
+    with closing(conn()) as c:
+        c.executemany('INSERT OR REPLACE INTO market_universe(symbol,exchange,name,updated) VALUES(?,?,?,?)',records)
+        c.commit()
+    # Universe listing is a local cache, not an OCI snapshot until the next successful backup.
+    return {'listed':rows('SELECT COUNT(*) AS n FROM market_universe')[0]['n'],
+            'source_rows':len(records),'errors':errors,
+            'note':'Universe listing refreshed. Use batches of at most 150 for OHLCV. This is not a bulk market-data subscription.'}
+
 @app.post('/api/download')
 def download(req:Download):
     if req.period not in ('1y','2y','5y','10y','max'): raise HTTPException(400,'Invalid period')
