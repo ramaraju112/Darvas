@@ -1,4 +1,4 @@
-"""Scheduled runner: only 4 PM America/Chicago weekdays; never run outside hour."""
+"""Scheduled runner: 6 PM CT on Nov 17 2026 only, otherwise 4 PM CT weekdays."""
 import json
 import os
 import sys
@@ -11,11 +11,12 @@ from zoneinfo import ZoneInfo
 ZONE = ZoneInfo('America/Chicago')
 def in_window():
     now = datetime.now(ZONE)
-    return now.weekday() < 5 and now.hour == 16
+    hour = 18 if now.date().isoformat() == '2026-11-17' else 16
+    return now.weekday() < 5 and now.hour == hour
 
 def main():
     if not in_window():
-        print('Outside 4 PM CT weekday window; skipping (no catch-up)')
+        print('Outside allowed Central weekday window; skipping (no catch-up)')
         return 0
     base = os.environ['DARVAS_APP_URL'].rstrip('/')
     token = os.environ['DARVAS_SYNC_TOKEN']
@@ -43,7 +44,7 @@ def main():
             print('Completed eligible universe for today; processed:', count)
             return 0
         time.sleep(2)
-    print('4 PM window ending; saved checkpoints. Remaining symbols resume next scheduled day.')
+    print('Scheduled window ending; saved checkpoints. Remaining symbols resume next scheduled day.')
     return 0
 
 if __name__ == '__main__':
