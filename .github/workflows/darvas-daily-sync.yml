@@ -2,7 +2,7 @@ name: Darvas V7.4 — strict 4 PM Central full-market sync
 on:
   schedule:
     # GitHub schedules are UTC. Dual UTC entries account for CST/CDT;
-    # the Python runner rejects the out-of-window trigger .
+    # the Python runner rejects the out-of-window trigger.
     - cron: '0 21 * * 1-5'
     - cron: '0 22 * * 1-5'
   # Deliberately no workflow_dispatch: no bulk run outside scheduled window.
