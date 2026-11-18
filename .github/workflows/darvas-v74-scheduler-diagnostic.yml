@@ -1,0 +1,31 @@
+name: Darvas V7.4 Scheduler Diagnostic (No Downloads)
+
+on:
+  # Diagnostic only: Wednesday, Nov 18, 2026.
+  # 21:17, 21:37, 21:57, 22:17, 22:37, 22:57 UTC
+  # = 3:17, 3:37, 3:57, 4:17, 4:37, 4:57 PM CST.
+  # GitHub scheduled runs may be delayed or dropped.
+  schedule:
+    - cron: '17,37,57 21-22 18 11 *'
+  # Optional safe manual check of workflow execution; no stock downloads.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Print schedule diagnostics only
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          SCHEDULED_CRON: ${{ github.event.schedule }}
+        run: |
+          echo "Event: $EVENT_NAME"
+          echo "Scheduled cron: ${SCHEDULED_CRON:-manual diagnostic}"
+          echo "UTC time: $(date -u '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Central time: $(TZ=America/Chicago date '+%Y-%m-%d %H:%M:%S %Z')"
+          echo "Branch: $GITHUB_REF_NAME"
+          echo "Diagnostic only: no downloads, no Render calls, no Oracle writes."
