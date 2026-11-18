@@ -1,4 +1,4 @@
-"""Scheduled runner: 6 PM CT on Nov 17 2026 only, otherwise 4 PM CT weekdays."""
+"""Scheduled runner: 8:30 PM CT on Nov 17 2026 only, otherwise 4 PM CT weekdays."""
 import json
 import os
 import sys
@@ -11,8 +11,9 @@ from zoneinfo import ZoneInfo
 ZONE = ZoneInfo('America/Chicago')
 def in_window():
     now = datetime.now(ZONE)
-    hour = 18 if now.date().isoformat() == '2026-11-17' else 16
-    return now.weekday() < 5 and now.hour == hour
+    special = now.date().isoformat() == '2026-11-17'
+    hour = 20 if special else 16
+    return now.weekday() < 5 and now.hour == hour and (not special or now.minute >= 30)
 
 def main():
     if not in_window():
