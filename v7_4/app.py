@@ -367,15 +367,15 @@ def sync_coverage():
       FROM market_universe""")[0]
 
 def scheduled_sync_hour(local):
-    # One-day exception only. All other weekdays use 4 PM Central.
-    return 18 if local.date().isoformat() == '2026-11-17' else 16
+    # Nov 17 one-night 8:30 PM exception; all other weekdays use 4 PM Central.
+    return 20 if local.date().isoformat() == '2026-11-17' else 16
 
 @app.get('/api/sync/status')
 def sync_status():
     return {'timezone':'America/Chicago','scheduled_hour':f"{scheduled_sync_hour(datetime.now(ZoneInfo('America/Chicago'))):02d}:00",
             'coverage':sync_coverage(),
             'recent_batches':rows('SELECT * FROM sync_log ORDER BY id DESC LIMIT 12'),
-            'note':'6 PM Central on 2026-11-17 only; 4 PM Central other weekdays. No catch-up; Yahoo coverage not guaranteed.'}
+            'note':'8:30–9 PM Central on 2026-11-17 only; 4–5 PM Central other weekdays. No catch-up; Yahoo coverage not guaranteed.'}
 
 @app.post('/api/sync/batch')
 def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
@@ -383,7 +383,8 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
     if not expected or not secrets.compare_digest(x_darvas_sync_token,expected):
         raise HTTPException(403,'Invalid sync token')
     local=datetime.now(ZoneInfo('America/Chicago'))
-    if local.weekday()>=5 or local.hour!=scheduled_sync_hour(local):
+    if (local.weekday()>=5 or local.hour!=scheduled_sync_hour(local)
+        or (local.date().isoformat() == '2026-11-17' and local.minute < 30)):
         raise HTTPException(409,'Outside permitted Central weekday sync window')
     if limit<1 or limit>8: raise HTTPException(400,'Batch limit must be 1-8')
     if not LOCK.acquire(blocking=False): raise HTTPException(409,'Another database update is running')
