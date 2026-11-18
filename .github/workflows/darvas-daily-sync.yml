@@ -1,19 +1,24 @@
-name: Darvas V7.4 — 4 PM CT (Nov 17 one-day 6 PM exception)
+name: Darvas V7.4 — 4:10 PM CT (Nov 17 8:30 PM exception)
+
 on:
   schedule:
-    # GitHub schedules are UTC. Dual UTC entries account for CST/CDT;
-    # the Python runner rejects the out-of-window trigger.
-    - cron: '0 21 * * 1-5'
-    - cron: '0 22 * * 1-5'
-    # Nov 17 2026 at 6 PM CST is Nov 18 00:00 UTC.
-    # This cron repeats yearly, but the runner rejects it except on Nov 17 2026.
-    - cron: '0 0 18 11 *'
-  # Deliberately no workflow_dispatch: no bulk run outside scheduled window.
+    # Normal 4:10 PM Central on weekdays, CST/CDT respectively.
+    # Python runner and API reject the other DST trigger.
+    - cron: '10 21 * * 1-5'
+    - cron: '10 22 * * 1-5'
+    # Tue Nov 17 2026 8:30 PM CST = Wed Nov 18 02:30 UTC.
+    # GitHub cron syntax is recurring yearly; the Python guard
+    # allows this only on local Nov 17 2026, 8:30–9:00 PM CT.
+    - cron: '30 2 18 11 *'
+  # No workflow_dispatch: no manual sync.
+
 permissions:
   contents: read
+
 concurrency:
   group: darvas-full-market-sync
   cancel-in-progress: false
+
 jobs:
   daily-sync:
     runs-on: ubuntu-latest
