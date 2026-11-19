@@ -1,4 +1,4 @@
-"""Scheduled runner: 8:30 PM CT on Nov 17 2026 only, otherwise 4 PM CT weekdays."""
+"""Automatic Darvas sync: weekday 4–5 PM America/Chicago, no catch-up."""
 import json
 import os
 import sys
@@ -9,21 +9,24 @@ from urllib.request import Request, urlopen
 from zoneinfo import ZoneInfo
 
 ZONE = ZoneInfo('America/Chicago')
+
 def in_window():
     now = datetime.now(ZONE)
-    special = now.date().isoformat() == '2026-11-17'
-    hour = 20 if special else 16
-    return now.weekday() < 5 and now.hour == hour and (not special or now.minute >= 30)
+    return now.weekday() < 5 and now.hour == 16 and now.minute < 50
 
 def main():
+    now = datetime.now(ZONE)
+    print(f'Started: {now.isoformat()} (Central); weekday={now.weekday()}')
     if not in_window():
-        print('Outside allowed Central weekday window; skipping (no catch-up)')
+        print('SKIPPED: Outside 4:00–4:50 PM Central weekday start window; no catch-up.')
         return 0
     base = os.environ['DARVAS_APP_URL'].rstrip('/')
     token = os.environ['DARVAS_SYNC_TOKEN']
     count = 0
-    # Upper bound for GitHub Actions: do not start a batch near the end of hour.
-    while in_window() and datetime.now(ZONE).minute < 53:
+    successes = 0
+    # API checkpoints last_attempt by Central date, so multiple scheduled triggers
+    # do not download the same symbol twice on the same day.
+    while in_window():
         req = Request(base + '/api/sync/batch?limit=6', data=b'', method='POST',
                       headers={'X-Darvas-Sync-Token': token})
         try:
@@ -31,8 +34,10 @@ def main():
                 result = json.load(resp)
         except HTTPError as exc:
             print('Sync HTTP status:', exc.code)
-            # A busy server should not cause concurrent updates.
             if exc.code == 409:
+                # Could be busy, or the server's window closed. Recheck time.
+                if not in_window():
+                    break
                 time.sleep(10)
                 continue
             return 1
@@ -40,12 +45,16 @@ def main():
             print('Sync request failed:', type(exc).__name__)
             return 1
         count += result.get('attempted', 0)
-        print(json.dumps({k:v for k,v in result.items() if k not in ('report',)}, default=str))
+        successes += result.get('succeeded', 0)
+        print(json.dumps({k:v for k,v in result.items() if k != 'report'}, default=str), flush=True)
         if result.get('done'):
-            print('Completed eligible universe for today; processed:', count)
+            print(f'COMPLETED daily eligible queue: attempted={count}, succeeded={successes}')
+            return 0
+        if result.get('attempted', 0) == 0:
+            print('No symbols attempted; stopping to avoid a busy loop.')
             return 0
         time.sleep(2)
-    print('Scheduled window ending; saved checkpoints. Remaining symbols resume next scheduled day.')
+    print(f'WINDOW ENDED: attempted={count}, succeeded={successes}. Remaining symbols await next weekday.')
     return 0
 
 if __name__ == '__main__':
