@@ -150,6 +150,25 @@ def signal(symbol):
         'data_age_days':(datetime.now(timezone.utc).date()-pd.Timestamp(last.day).date()).days,
         'reason':'Separate provisional Darvas breakout and independent recovery discovery; neither is a verified entry signal'}
 
+# V7.5 shadow research API. Existing V7.4 signals, caches, and sync remain unchanged.
+from engines.v75 import classic as v75_classic, recovery as v75_recovery, VERSION as V75_ENGINE_VERSION
+
+@app.get('/api/v75/shadow/{symbol}')
+def v75_shadow(symbol: str):
+    symbol = clean_symbol(symbol)
+    df = history(symbol)
+    if len(df) < 65:
+        return {'symbol': symbol, 'version': V75_ENGINE_VERSION,
+                'status': 'DATA_INCOMPLETE', 'bars': len(df),
+                'classic': {'stage': 'DATA_INCOMPLETE'},
+                'recovery': {'stage': 'DATA_INCOMPLETE'}}
+    d = indicators(df)
+    return {'symbol': symbol, 'version': V75_ENGINE_VERSION,
+            'status': 'SHADOW_RESEARCH_ONLY', 'date': str(d.iloc[-1]['day']),
+            'bars': len(d), 'classic': v75_classic(d),
+            'recovery': v75_recovery(d),
+            'warning': 'Experimental independent V7.5 engines; no trading recommendation. Existing V7.4 endpoints unchanged.'}
+
 class Download(BaseModel):
     symbols:list[str]=DEFAULT
     period:str='10y'
