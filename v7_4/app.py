@@ -511,6 +511,49 @@ def scan():
     discovery=sorted([x for x in results if x.get('recovery_discovery')],key=lambda x:(x.get('hma_slope3_pct') or 0),reverse=True)
     return {'scanned':len(results),'darvas':darvas,'recovery':recovery,'recovery_discovery':discovery,
             'all':results[:250],'total_results':len(results),'disclaimer':'Cached independent provisional screens. Data quality, universe completeness and confirmed Darvas pivots are not validated.'}
+# V7.5 read-only paginated research scan. Does not mutate bars, caches or Oracle snapshots.
+@app.get('/api/v75/scan')
+def v75_scan(offset: int = 0, limit: int = 20):
+    if offset < 0 or not 1 <= limit <= 30:
+        raise HTTPException(400, 'offset must be >= 0 and limit between 1 and 30')
+    # Only symbols with stored history and active eligible universe classification.
+    # A symbol without enough history is reported rather than silently omitted.
+    total = rows("""SELECT COUNT(*) AS n FROM (
+        SELECT DISTINCT b.symbol FROM bars b JOIN market_universe u ON u.symbol=b.symbol
+        WHERE u.active=1 AND u.eligible=1 AND b.symbol NOT IN ('SPY','QQQ')
+    )""")[0]['n']
+    symbols = rows("""SELECT DISTINCT b.symbol FROM bars b
+        JOIN market_universe u ON u.symbol=b.symbol
+        WHERE u.active=1 AND u.eligible=1 AND b.symbol NOT IN ('SPY','QQQ')
+        ORDER BY b.symbol LIMIT ? OFFSET ?""", (limit, offset))
+    output=[]
+    for item in symbols:
+        symbol=item['symbol']
+        try:
+            df=history(symbol)
+            if len(df)<65:
+                output.append({'symbol':symbol,'bars':len(df),'status':'DATA_INCOMPLETE',
+                               'classic':{'stage':'DATA_INCOMPLETE','watch':False,'score':0},
+                               'recovery':{'stage':'DATA_INCOMPLETE','watch':False,'discovery':False,'score':0}})
+                continue
+            d=indicators(df)
+            latest=d.iloc[-1]
+            output.append({'symbol':symbol,'bars':len(d),'status':'SHADOW_RESEARCH_ONLY',
+                           'date':str(latest['day']),
+                           'price':round(float(latest['close']),3),
+                           'data_age_days':(datetime.now(timezone.utc).date()-pd.Timestamp(latest['day']).date()).days,
+                           'classic':v75_classic(d),'recovery':v75_recovery(d)})
+        except Exception as exc:
+            import logging
+            logging.exception('V7.5 shadow scan failed for %s',symbol)
+            output.append({'symbol':symbol,'status':'CALCULATION_ERROR',
+                           'error_type':type(exc).__name__})
+    return {'version':V75_ENGINE_VERSION,'mode':'SHADOW_RESEARCH_ONLY',
+            'offset':offset,'limit':limit,'total_stored_eligible':total,
+            'processed':len(output),'next_offset':offset+len(output) if offset+len(output)<total else None,
+            'results':output,
+            'warning':'Read-only, stored OHLCV only. Universe coverage and data freshness are not guaranteed. No trading recommendations.'}
+
 @app.get('/api/prices/{symbol}')
 def prices(symbol:str):
     symbol=clean_symbol(symbol); d=history(symbol)
