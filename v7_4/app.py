@@ -366,26 +366,31 @@ def sync_coverage():
       SUM(CASE WHEN eligible=1 AND active=1 AND failures>0 THEN 1 ELSE 0 END) with_failures
       FROM market_universe""")[0]
 
+SYNC_ZONE = ZoneInfo('America/Chicago')
+
+def in_sync_window(local=None):
+    """Weekdays 16:00–16:49 Central; reserve time for a final network call/backup."""
+    local = local or datetime.now(SYNC_ZONE)
+    return local.weekday() < 5 and local.hour == 16 and local.minute < 50
+
 def scheduled_sync_hour(local):
-    # Nov 17 one-night 8:30 PM exception; all other weekdays use 4 PM Central.
-    return 20 if local.date().isoformat() == '2026-11-17' else 16
+    return 16
 
 @app.get('/api/sync/status')
 def sync_status():
     return {'timezone':'America/Chicago','scheduled_hour':f"{scheduled_sync_hour(datetime.now(ZoneInfo('America/Chicago'))):02d}:00",
             'coverage':sync_coverage(),
             'recent_batches':rows('SELECT * FROM sync_log ORDER BY id DESC LIMIT 12'),
-            'note':'8:30–9 PM Central on 2026-11-17 only; 4–5 PM Central other weekdays. No catch-up; Yahoo coverage not guaranteed.'}
+            'note':'Automatic weekday 4–5 PM Central processing; new batches stop by 4:50 PM to allow shutdown. No catch-up. Yahoo coverage not guaranteed.'}
 
 @app.post('/api/sync/batch')
 def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
     expected=os.getenv('DARVAS_SYNC_TOKEN','')
     if not expected or not secrets.compare_digest(x_darvas_sync_token,expected):
         raise HTTPException(403,'Invalid sync token')
-    local=datetime.now(ZoneInfo('America/Chicago'))
-    if (local.weekday()>=5 or local.hour!=scheduled_sync_hour(local)
-        or (local.date().isoformat() == '2026-11-17' and local.minute < 30)):
-        raise HTTPException(409,'Outside permitted Central weekday sync window')
+    local=datetime.now(SYNC_ZONE)
+    if not in_sync_window(local):
+        raise HTTPException(409,'Outside permitted Central weekday sync window (4:00–4:50 PM)')
     if limit<1 or limit>8: raise HTTPException(400,'Batch limit must be 1-8')
     if not LOCK.acquire(blocking=False): raise HTTPException(409,'Another database update is running')
     try:
@@ -414,6 +419,9 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
             return {'done':True,'coverage':sync_coverage(),'refreshed':refreshed,'attempted':0}
         report=[]
         for item in batch:
+            # Never start another Yahoo download after the cutoff.
+            if not in_sync_window():
+                break
             sym=item['symbol'];last_day=item['last_day']
             try:
                 kwargs={'interval':'1d','auto_adjust':False,'progress':False,'threads':False,'timeout':15}
@@ -446,12 +454,14 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
         succeeded=sum('saved' in r for r in report)
         with closing(conn()) as c:
             c.execute('INSERT INTO sync_log(run_day,batch_offset,attempted,succeeded,errors,backup,created) VALUES(?,?,?,?,?,?,?)',
-                      (today,0,len(batch),succeeded,len(batch)-succeeded,'pending',datetime.now(timezone.utc).isoformat()))
+                      (today,0,len(report),succeeded,len(report)-succeeded,'pending',datetime.now(timezone.utc).isoformat()))
             log_id=c.execute('SELECT last_insert_rowid()').fetchone()[0]
-            c.execute('UPDATE sync_log SET backup=? WHERE id=?',('attempted',log_id))
             c.commit()
-        # Backup before returning, including progress and failed attempts.
+        # Backup before returning. If backup fails, preserve an explicit error response.
         backup_after_change()
+        with closing(conn()) as c:
+            c.execute('UPDATE sync_log SET backup=? WHERE id=?', ('ok',log_id))
+            c.commit()
         remaining=rows('SELECT COUNT(*) n FROM market_universe WHERE active=1 AND eligible=1 AND (last_attempt IS NULL OR last_attempt<?)',(today,))[0]['n']
         return {'done':remaining==0,'attempted':len(batch),'succeeded':succeeded,
                 'failed':len(batch)-succeeded,'remaining_today':remaining,'coverage':sync_coverage(),
