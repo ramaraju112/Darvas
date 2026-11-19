@@ -10,7 +10,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 from fastapi import FastAPI, HTTPException, UploadFile, File, Header
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -150,6 +150,25 @@ def signal(symbol):
         'data_age_days':(datetime.now(timezone.utc).date()-pd.Timestamp(last.day).date()).days,
         'reason':'Separate provisional Darvas breakout and independent recovery discovery; neither is a verified entry signal'}
 
+# V7.5 shadow research API. Existing V7.4 signals, caches, and sync remain unchanged.
+from engines.v75 import classic as v75_classic, recovery as v75_recovery, VERSION as V75_ENGINE_VERSION
+
+@app.get('/api/v75/shadow/{symbol}')
+def v75_shadow(symbol: str):
+    symbol = clean_symbol(symbol)
+    df = history(symbol)
+    if len(df) < 65:
+        return {'symbol': symbol, 'version': V75_ENGINE_VERSION,
+                'status': 'DATA_INCOMPLETE', 'bars': len(df),
+                'classic': {'stage': 'DATA_INCOMPLETE'},
+                'recovery': {'stage': 'DATA_INCOMPLETE'}}
+    d = indicators(df)
+    return {'symbol': symbol, 'version': V75_ENGINE_VERSION,
+            'status': 'SHADOW_RESEARCH_ONLY', 'date': str(d.iloc[-1]['day']),
+            'bars': len(d), 'classic': v75_classic(d),
+            'recovery': v75_recovery(d),
+            'warning': 'Experimental independent V7.5 engines; no trading recommendation. Existing V7.4 endpoints unchanged.'}
+
 class Download(BaseModel):
     symbols:list[str]=DEFAULT
     period:str='10y'
@@ -163,21 +182,6 @@ class Alert(BaseModel):
 
 @app.get('/')
 def index(): return FileResponse(ROOT/'static'/'index.html')
-
-# Lightweight readiness endpoints. Never fetch market data or modify SQLite/OCI.
-@app.head('/')
-def head_root():
-    from fastapi import Response
-    return Response(status_code=200)
-
-@app.get('/health')
-def health():
-    return {'status': 'ok', 'application': 'Darvas V7.4'}
-
-@app.head('/health')
-def head_health():
-    from fastapi import Response
-    return Response(status_code=200)
 
 @app.get('/api/status')
 def status():
@@ -195,26 +199,74 @@ def status():
         'positions': rows('SELECT * FROM positions ORDER BY symbol'),
         'runs': rows('SELECT * FROM runs ORDER BY id DESC LIMIT 5')
     }
-# Conservative listing filter: only names explicitly identifying ordinary/common equity.
-# Exchange directory metadata is not a comprehensive security master; report unknowns.
-EXCLUDE_NAME = re.compile(r'\b(warrant|warrants|unit|units|right|rights|preferred|preference|\bETF\b|\bETN\b|fund|trust|note|bond|debenture|certificate|subscription|depositary shares? representing preferred)\b', re.I)
-INCLUDE_NAME = re.compile(r'\b(common stock|common shares?|ordinary shares?|ordinary stock|class [a-z] common|american depositary shares?|american depositary receipts?|\bADS\b|\bADR\b)\b', re.I)
+# Universe is a candidate pool, not a certified count of common equities.
+# Do not silently discard ambiguous names: mark them UNVERIFIED and keep them
+# in the download candidate pool. Audit before interpreting screening coverage.
+NON_EQUITY_NAME = re.compile(
+    r"\b(warrants?|units?|rights?|preferred|preference|etfs?|etns?|"
+    r"closed.end fund|mutual fund|exchange.traded fund|"
+    r"notes?|bonds?|debentures?|certificates?|subscription rights?|"
+    r"depositary shares? representing preferred|"
+    r"depositary shares? each representing.*preferred)\b", re.I)
+COMMON_NAME = re.compile(
+    r"\b(common stock|common shares?|ordinary shares?|ordinary stock|"
+    r"class [a-z] (?:common )?stock|class [a-z] common|"
+    r"american depositary shares?|american depositary receipts?|ads|adr)\b", re.I)
+NON_EQUITY_SUFFIX = ('.WS', '.WT', '.U', '.R', '.W')
+
+def equity_classification(symbol, name, etf=False, test=False):
+    name = str(name or '').strip()
+    if test: return 'EXCLUDED', 'exchange directory test issue'
+    if etf: return 'EXCLUDED', 'exchange directory ETF flag'
+    if symbol.endswith(NON_EQUITY_SUFFIX):
+        return 'EXCLUDED', 'non-common security ticker suffix'
+    if NON_EQUITY_NAME.search(name):
+        return 'EXCLUDED', 'name indicates non-common instrument'
+    if COMMON_NAME.search(name):
+        return 'CONFIRMED_CANDIDATE', 'name explicitly describes common/ordinary/ADR equity'
+    return 'UNVERIFIED', 'security type not proven by directory name; included pending review'
 
 def classify_common_equity(symbol, name, etf=False, test=False):
-    name=str(name or '')
-    if etf or test: return False, 'ETF or test issue'
-    if symbol.endswith(('.WS','.WT','.U','.R')): return False, 'non-common symbol suffix'
-    if EXCLUDE_NAME.search(name): return False, 'security name indicates non-common instrument'
-    if INCLUDE_NAME.search(name): return True, 'explicit common/ordinary/ADR description'
-    return False, 'unverified security type (conservative exclusion)'
+    status, reason = equity_classification(symbol, name, etf, test)
+    return status != 'EXCLUDED', reason
 
 @app.get('/api/universe')
 def universe(offset:int=0,limit:int=150):
     if offset<0 or not 1<=limit<=150: raise HTTPException(400,'Invalid pagination')
     total=rows('SELECT COUNT(*) AS n FROM market_universe WHERE active=1 AND eligible=1')[0]['n']
-    entries=rows('SELECT symbol,exchange,name FROM market_universe WHERE active=1 AND eligible=1 ORDER BY symbol LIMIT ? OFFSET ?',(limit,offset))
+    entries=rows('SELECT symbol,exchange,name,reason FROM market_universe WHERE active=1 AND eligible=1 ORDER BY symbol LIMIT ? OFFSET ?',(limit,offset))
     return {'total':total,'offset':offset,'limit':limit,'symbols':entries,
-            'note':'Conservative common/ordinary/ADR candidate universe. Directory classification may omit or misclassify some securities.'}
+            'note':'Candidate equity universe includes UNVERIFIED listings to reduce false exclusions; it is NOT a verified complete common-stock list.'}
+
+@app.get('/api/universe/audit')
+def universe_audit():
+    summary=rows("""SELECT
+        COUNT(*) AS stored,
+        SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) AS active,
+        SUM(CASE WHEN active=1 AND eligible=1 THEN 1 ELSE 0 END) AS candidates,
+        SUM(CASE WHEN active=1 AND eligible=1 AND reason LIKE 'security type not proven%' THEN 1 ELSE 0 END) AS unverified,
+        SUM(CASE WHEN active=1 AND eligible=0 THEN 1 ELSE 0 END) AS excluded,
+        SUM(CASE WHEN active=1 AND eligible=1 AND last_success IS NOT NULL THEN 1 ELSE 0 END) AS ever_downloaded
+        FROM market_universe""")[0]
+    reasons=rows("""SELECT reason,COUNT(*) AS count FROM market_universe
+        WHERE active=1 GROUP BY reason ORDER BY count DESC""")
+    sources=rows("""SELECT exchange, COUNT(*) AS count, MAX(updated) AS last_updated
+        FROM market_universe WHERE active=1 GROUP BY exchange ORDER BY exchange""")
+    return {'summary':summary,'reasons':reasons,'sources':sources,
+            'warning':'Directory names are not a security master. Independently reconcile all unverified candidates and missing tickers.'}
+
+@app.get('/api/universe/export.csv')
+def universe_export(include_inactive:bool=False):
+    where='' if include_inactive else 'WHERE active=1'
+    records=rows('SELECT symbol,exchange,name,active,eligible,reason,updated,last_success,failures,last_error '
+                 'FROM market_universe '+where+' ORDER BY symbol')
+    output=io.StringIO()
+    writer=csv.writer(output)
+    writer.writerow(['symbol','exchange','name','active','candidate','classification_reason','directory_updated','last_success','failures','last_error'])
+    for r in records:
+        writer.writerow([r[k] for k in ('symbol','exchange','name','active','eligible','reason','updated','last_success','failures','last_error')])
+    return StreamingResponse(iter([output.getvalue()]),media_type='text/csv',
+                             headers={'Content-Disposition':'attachment; filename="darvas_universe_audit.csv"'})
 
 def update_universe_from_directories():
     sources=[('NASDAQ','https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt','Symbol','Security Name'),
@@ -241,7 +293,6 @@ def update_universe_from_directories():
             records=[r for r in records if r[1]!=exchange]
     if not records: raise RuntimeError('Both symbol directories unavailable: '+'; '.join(errors))
     with closing(conn()) as c:
-        # Only deactivate a source after its fresh directory was downloaded successfully.
         for exchange in {r[1] for r in records}:
             c.execute('UPDATE market_universe SET active=0 WHERE exchange=?',(exchange,))
         c.executemany("""INSERT INTO market_universe(symbol,exchange,name,updated,eligible,reason,active)
@@ -250,7 +301,8 @@ def update_universe_from_directories():
              eligible=excluded.eligible,reason=excluded.reason,active=1""",records)
         c.commit()
     counts=rows('SELECT COUNT(*) total, SUM(CASE WHEN active=1 AND eligible=1 THEN 1 ELSE 0 END) eligible FROM market_universe')[0]
-    return {'listed':counts['total'],'eligible':counts['eligible'] or 0,'errors':errors,'sources_ok':successful}
+    return {'listed':counts['total'],'eligible':counts['eligible'] or 0,'errors':errors,'sources_ok':successful,
+            'note':'eligible is a broad CANDIDATE pool including unverified equity; use /api/universe/audit'}
 
 @app.post('/api/universe/refresh')
 def refresh_universe():
@@ -316,7 +368,7 @@ def excluded_security(symbol):
     entry=rows('SELECT name FROM market_universe WHERE symbol=?',(symbol,))
     name=(entry[0]['name'] if entry else '').lower()
     bad=(' warrant', ' warrants', ' unit ', ' units ', ' right ', ' rights ',
-         ' preferred', ' depositary share', ' acquisition corp')
+         ' preferred', ' depositary share')
     return any(term in ' '+name+' ' for term in bad) or symbol.endswith(('.WS','.WT','.U'))
 
 @app.post('/api/stock/refresh/{symbol}')
@@ -333,21 +385,31 @@ def sync_coverage():
       SUM(CASE WHEN eligible=1 AND active=1 AND failures>0 THEN 1 ELSE 0 END) with_failures
       FROM market_universe""")[0]
 
+SYNC_ZONE = ZoneInfo('America/Chicago')
+
+def in_sync_window(local=None):
+    """Weekdays 16:00–16:49 Central; reserve time for a final network call/backup."""
+    local = local or datetime.now(SYNC_ZONE)
+    return local.weekday() < 5 and local.hour == 16 and local.minute < 50
+
+def scheduled_sync_hour(local):
+    return 16
+
 @app.get('/api/sync/status')
 def sync_status():
-    return {'timezone':'America/Chicago','scheduled_hour':'16:00',
+    return {'timezone':'America/Chicago','scheduled_hour':f"{scheduled_sync_hour(datetime.now(ZoneInfo('America/Chicago'))):02d}:00",
             'coverage':sync_coverage(),
             'recent_batches':rows('SELECT * FROM sync_log ORDER BY id DESC LIMIT 12'),
-            'note':'Strict 4 PM weekday window, no catch-up; initial full-universe history may take many sessions. Yahoo coverage is not guaranteed.'}
+            'note':'Automatic weekday 4–5 PM Central processing; new batches stop by 4:50 PM to allow shutdown. No catch-up. Yahoo coverage not guaranteed.'}
 
 @app.post('/api/sync/batch')
 def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
     expected=os.getenv('DARVAS_SYNC_TOKEN','')
     if not expected or not secrets.compare_digest(x_darvas_sync_token,expected):
         raise HTTPException(403,'Invalid sync token')
-    local=datetime.now(ZoneInfo('America/Chicago'))
-    if local.weekday()>=5 or local.hour!=16:
-        raise HTTPException(409,'Strict 4 PM Central weekday window only')
+    local=datetime.now(SYNC_ZONE)
+    if not in_sync_window(local):
+        raise HTTPException(409,'Outside permitted Central weekday sync window (4:00–4:50 PM)')
     if limit<1 or limit>8: raise HTTPException(400,'Batch limit must be 1-8')
     if not LOCK.acquire(blocking=False): raise HTTPException(409,'Another database update is running')
     try:
@@ -376,6 +438,9 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
             return {'done':True,'coverage':sync_coverage(),'refreshed':refreshed,'attempted':0}
         report=[]
         for item in batch:
+            # Never start another Yahoo download after the cutoff.
+            if not in_sync_window():
+                break
             sym=item['symbol'];last_day=item['last_day']
             try:
                 kwargs={'interval':'1d','auto_adjust':False,'progress':False,'threads':False,'timeout':15}
@@ -408,12 +473,14 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
         succeeded=sum('saved' in r for r in report)
         with closing(conn()) as c:
             c.execute('INSERT INTO sync_log(run_day,batch_offset,attempted,succeeded,errors,backup,created) VALUES(?,?,?,?,?,?,?)',
-                      (today,0,len(batch),succeeded,len(batch)-succeeded,'pending',datetime.now(timezone.utc).isoformat()))
+                      (today,0,len(report),succeeded,len(report)-succeeded,'pending',datetime.now(timezone.utc).isoformat()))
             log_id=c.execute('SELECT last_insert_rowid()').fetchone()[0]
-            c.execute('UPDATE sync_log SET backup=? WHERE id=?',('attempted',log_id))
             c.commit()
-        # Backup before returning, including progress and failed attempts.
+        # Backup before returning. If backup fails, preserve an explicit error response.
         backup_after_change()
+        with closing(conn()) as c:
+            c.execute('UPDATE sync_log SET backup=? WHERE id=?', ('ok',log_id))
+            c.commit()
         remaining=rows('SELECT COUNT(*) n FROM market_universe WHERE active=1 AND eligible=1 AND (last_attempt IS NULL OR last_attempt<?)',(today,))[0]['n']
         return {'done':remaining==0,'attempted':len(batch),'succeeded':succeeded,
                 'failed':len(batch)-succeeded,'remaining_today':remaining,'coverage':sync_coverage(),
@@ -424,7 +491,7 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
 def scan():
     # Cached screening avoids recalculating thousands of 10-year histories on every page view.
     cached=rows('''SELECT s.symbol,s.payload FROM screen_cache s LEFT JOIN market_universe u ON u.symbol=s.symbol
-                   WHERE u.symbol IS NULL OR (u.active=1 AND u.eligible=1) ORDER BY s.symbol''')
+                   WHERE u.active=1 AND u.eligible=1 ORDER BY s.symbol''')
     results=[]
     for item in cached:
         try:
@@ -433,7 +500,7 @@ def scan():
         except (ValueError, TypeError): continue
     # Existing symbols from before this upgrade are lazily cached, bounded per request.
     uncached=rows("""SELECT DISTINCT b.symbol FROM bars b LEFT JOIN screen_cache s ON s.symbol=b.symbol
-                    WHERE s.symbol IS NULL ORDER BY b.symbol LIMIT 100""")
+                    WHERE s.symbol IS NULL AND EXISTS (SELECT 1 FROM market_universe u WHERE u.symbol=b.symbol AND u.active=1 AND u.eligible=1) ORDER BY b.symbol LIMIT 100""")
     for item in uncached:
         sym=item['symbol']
         if sym in ('SPY','QQQ') or excluded_security(sym): continue
@@ -444,6 +511,49 @@ def scan():
     discovery=sorted([x for x in results if x.get('recovery_discovery')],key=lambda x:(x.get('hma_slope3_pct') or 0),reverse=True)
     return {'scanned':len(results),'darvas':darvas,'recovery':recovery,'recovery_discovery':discovery,
             'all':results[:250],'total_results':len(results),'disclaimer':'Cached independent provisional screens. Data quality, universe completeness and confirmed Darvas pivots are not validated.'}
+# V7.5 read-only paginated research scan. Does not mutate bars, caches or Oracle snapshots.
+@app.get('/api/v75/scan')
+def v75_scan(offset: int = 0, limit: int = 20):
+    if offset < 0 or not 1 <= limit <= 30:
+        raise HTTPException(400, 'offset must be >= 0 and limit between 1 and 30')
+    # Only symbols with stored history and active eligible universe classification.
+    # A symbol without enough history is reported rather than silently omitted.
+    total = rows("""SELECT COUNT(*) AS n FROM (
+        SELECT DISTINCT b.symbol FROM bars b JOIN market_universe u ON u.symbol=b.symbol
+        WHERE u.active=1 AND u.eligible=1 AND b.symbol NOT IN ('SPY','QQQ')
+    )""")[0]['n']
+    symbols = rows("""SELECT DISTINCT b.symbol FROM bars b
+        JOIN market_universe u ON u.symbol=b.symbol
+        WHERE u.active=1 AND u.eligible=1 AND b.symbol NOT IN ('SPY','QQQ')
+        ORDER BY b.symbol LIMIT ? OFFSET ?""", (limit, offset))
+    output=[]
+    for item in symbols:
+        symbol=item['symbol']
+        try:
+            df=history(symbol)
+            if len(df)<65:
+                output.append({'symbol':symbol,'bars':len(df),'status':'DATA_INCOMPLETE',
+                               'classic':{'stage':'DATA_INCOMPLETE','watch':False,'score':0},
+                               'recovery':{'stage':'DATA_INCOMPLETE','watch':False,'discovery':False,'score':0}})
+                continue
+            d=indicators(df)
+            latest=d.iloc[-1]
+            output.append({'symbol':symbol,'bars':len(d),'status':'SHADOW_RESEARCH_ONLY',
+                           'date':str(latest['day']),
+                           'price':round(float(latest['close']),3),
+                           'data_age_days':(datetime.now(timezone.utc).date()-pd.Timestamp(latest['day']).date()).days,
+                           'classic':v75_classic(d),'recovery':v75_recovery(d)})
+        except Exception as exc:
+            import logging
+            logging.exception('V7.5 shadow scan failed for %s',symbol)
+            output.append({'symbol':symbol,'status':'CALCULATION_ERROR',
+                           'error_type':type(exc).__name__})
+    return {'version':V75_ENGINE_VERSION,'mode':'SHADOW_RESEARCH_ONLY',
+            'offset':offset,'limit':limit,'total_stored_eligible':total,
+            'processed':len(output),'next_offset':offset+len(output) if offset+len(output)<total else None,
+            'results':output,
+            'warning':'Read-only, stored OHLCV only. Universe coverage and data freshness are not guaranteed. No trading recommendations.'}
+
 @app.get('/api/prices/{symbol}')
 def prices(symbol:str):
     symbol=clean_symbol(symbol); d=history(symbol)
