@@ -1,22 +1,19 @@
-name: Darvas V7.4 — 4:10 PM CT (Nov 17 8:30 PM exception)
+name: Darvas V7.4 — Weekday 4 PM Central Sync
 
 on:
   schedule:
-    # Normal 4:10 PM Central on weekdays, CST/CDT respectively.
-    # Python runner and API reject the other DST trigger.
-    - cron: '10 21 * * 1-5'
-    - cron: '10 22 * * 1-5'
-    # Tue Nov 17 2026 8:30 PM CST = Wed Nov 18 02:30 UTC.
-    # GitHub cron syntax is recurring yearly; the Python guard
-    # allows this only on local Nov 17 2026, 8:30–9:00 PM CT.
-    - cron: '30 2 18 11 *'
-  # No workflow_dispatch: no manual sync.
+    # GitHub cron is UTC; only one of these UTC hours falls inside 4 PM Central.
+    # CDT (UTC-5): 4:10, 4:25, 4:40 PM Central
+    - cron: '10,25,40 21 * * 1-5'
+    # CST (UTC-6): 4:10, 4:25, 4:40 PM Central
+    - cron: '10,25,40 22 * * 1-5'
+  # Intentionally no workflow_dispatch: automatic-only market downloads.
 
 permissions:
   contents: read
 
 concurrency:
-  group: darvas-full-market-sync
+  group: darvas-v74-market-sync
   cancel-in-progress: false
 
 jobs:
