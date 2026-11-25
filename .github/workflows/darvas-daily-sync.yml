@@ -2,12 +2,9 @@ name: Darvas V7.4 — Weekday 4 PM Central Sync
 
 on:
   schedule:
-    # GitHub cron is UTC; only one of these UTC hours falls inside 4 PM Central.
-    # CDT (UTC-5): 4:10, 4:25, 4:40 PM Central
-    - cron: '10,25,40 21 * * 1-5'
-    # CST (UTC-6): 4:10, 4:25, 4:40 PM Central
-    - cron: '10,25,40 22 * * 1-5'
-  # Intentionally no workflow_dispatch: automatic-only market downloads.
+    # 22:10 UTC = 4:10 PM CST / 5:10 PM CDT, always after close.
+    - cron: '10 22 * * 1-5'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,13 +16,13 @@ concurrency:
 jobs:
   daily-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 58
+    timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Scheduled Central-time updater
+      - name: Resumable market data updater
         env:
           DARVAS_APP_URL: https://darvas-v74.onrender.com
           DARVAS_SYNC_TOKEN: ${{ secrets.DARVAS_SYNC_TOKEN }}
