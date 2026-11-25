@@ -387,11 +387,6 @@ def sync_coverage():
 
 SYNC_ZONE = ZoneInfo('America/Chicago')
 
-def in_sync_window(local=None):
-    """Weekdays 16:00–16:49 Central; reserve time for a final network call/backup."""
-    local = local or datetime.now(SYNC_ZONE)
-    return local.weekday() < 5 and local.hour == 16 and local.minute < 50
-
 def scheduled_sync_hour(local):
     return 16
 
@@ -400,7 +395,7 @@ def sync_status():
     return {'timezone':'America/Chicago','scheduled_hour':f"{scheduled_sync_hour(datetime.now(ZoneInfo('America/Chicago'))):02d}:00",
             'coverage':sync_coverage(),
             'recent_batches':rows('SELECT * FROM sync_log ORDER BY id DESC LIMIT 12'),
-            'note':'Automatic weekday 4–5 PM Central processing; new batches stop by 4:50 PM to allow shutdown. No catch-up. Yahoo coverage not guaranteed.'}
+            'note':'Scheduled after market close; authenticated batches allowed anytime. Daily attempt checkpoints; Yahoo coverage not guaranteed.'}
 
 @app.post('/api/sync/batch')
 def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
@@ -408,8 +403,6 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
     if not expected or not secrets.compare_digest(x_darvas_sync_token,expected):
         raise HTTPException(403,'Invalid sync token')
     local=datetime.now(SYNC_ZONE)
-    if not in_sync_window(local):
-        raise HTTPException(409,'Outside permitted Central weekday sync window (4:00–4:50 PM)')
     if limit<1 or limit>8: raise HTTPException(400,'Batch limit must be 1-8')
     if not LOCK.acquire(blocking=False): raise HTTPException(409,'Another database update is running')
     try:
@@ -438,9 +431,6 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
             return {'done':True,'coverage':sync_coverage(),'refreshed':refreshed,'attempted':0}
         report=[]
         for item in batch:
-            # Never start another Yahoo download after the cutoff.
-            if not in_sync_window():
-                break
             sym=item['symbol'];last_day=item['last_day']
             try:
                 kwargs={'interval':'1d','auto_adjust':False,'progress':False,'threads':False,'timeout':15}
@@ -482,8 +472,8 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
             c.execute('UPDATE sync_log SET backup=? WHERE id=?', ('ok',log_id))
             c.commit()
         remaining=rows('SELECT COUNT(*) n FROM market_universe WHERE active=1 AND eligible=1 AND (last_attempt IS NULL OR last_attempt<?)',(today,))[0]['n']
-        return {'done':remaining==0,'attempted':len(batch),'succeeded':succeeded,
-                'failed':len(batch)-succeeded,'remaining_today':remaining,'coverage':sync_coverage(),
+        return {'done':remaining==0,'attempted':len(report),'succeeded':succeeded,
+                'failed':len(report)-succeeded,'remaining_today':remaining,'coverage':sync_coverage(),
                 'oracle_backup':'ok','refreshed':refreshed,'report':report}
     finally: LOCK.release()
 
