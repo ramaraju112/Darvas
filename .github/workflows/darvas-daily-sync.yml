@@ -5,9 +5,15 @@ on:
     # 22:10 UTC = 4:10 PM CST / 5:10 PM CDT, always after close.
     - cron: '10 22 * * 1-5'
   workflow_dispatch:
+    inputs:
+      continuation:
+        description: Continuation count (automatic)
+        default: "0"
+        type: string
 
 permissions:
   contents: read
+  actions: write
 
 concurrency:
   group: darvas-v74-market-sync
@@ -16,7 +22,7 @@ concurrency:
 jobs:
   daily-sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 145
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -26,4 +32,20 @@ jobs:
         env:
           DARVAS_APP_URL: https://darvas-v74.onrender.com
           DARVAS_SYNC_TOKEN: ${{ secrets.DARVAS_SYNC_TOKEN }}
-        run: python v7_4/Scripts/daily_sync.py
+          GH_TOKEN: ${{ github.token }}
+          CONTINUATION: ${{ inputs.continuation || '0' }}
+        run: |
+          set +e
+          python v7_4/Scripts/daily_sync.py
+          rc=$?
+          set -e
+          if [ "$rc" -eq 75 ]; then
+            if [[ ! "$CONTINUATION" =~ ^[0-9]+$ ]] || [ "$CONTINUATION" -ge 8 ]; then
+              echo "Continuation cap reached; inspect coverage."
+              exit 1
+            fi
+            gh workflow run darvas-daily-sync.yml --ref main -f continuation="$((CONTINUATION + 1))"
+            echo "Continuation queued; market sync is not yet complete."
+          else
+            exit "$rc"
+          fi
