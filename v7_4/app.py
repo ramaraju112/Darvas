@@ -416,15 +416,14 @@ def sync_batch(limit:int=6, x_darvas_sync_token:str=Header(default='')):
                     raise HTTPException(503,'Universe refresh failed and no cached universe exists') from None
                 refreshed={'warning':'Universe refresh failed; using cached eligible listings'}
         # A symbol is attempted at most once per local day, avoiding repeated throttling.
-        # Prioritize existing history needing daily updates, then initial 10y backfill.
+        # Prioritize unfinished initial sync, then existing history.
         today=local.date().isoformat()
         batch=rows("""SELECT u.symbol, u.last_success,
                (SELECT MAX(b.day) FROM bars b WHERE b.symbol=u.symbol) last_day
                FROM market_universe u
                WHERE u.active=1 AND u.eligible=1
                  AND (u.last_attempt IS NULL OR u.last_attempt < ?)
-               ORDER BY CASE WHEN EXISTS(SELECT 1 FROM bars b WHERE b.symbol=u.symbol)
-                             THEN 0 ELSE 1 END,
+               ORDER BY CASE WHEN u.last_success IS NULL THEN 0 ELSE 1 END,
                         COALESCE(u.last_attempt,'') ASC, u.symbol ASC LIMIT ?""",(today,limit))
         if not batch:
             backup_after_change() if refreshed else None
