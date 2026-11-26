@@ -17,12 +17,12 @@ def main():
         print('ERROR: DARVAS_SYNC_TOKEN is missing', flush=True)
         return 1
     attempted = succeeded = failed = consecutive_errors = 0
-    deadline = time.monotonic() + 330 * 60
+    deadline = time.monotonic() + 120 * 60
     while time.monotonic() < deadline:
         req = Request(base + '/api/sync/batch?limit=6', data=b'', method='POST',
                       headers={'X-Darvas-Sync-Token': token})
         try:
-            with urlopen(req, timeout=180) as resp:
+            with urlopen(req, timeout=240) as resp:
                 result = json.load(resp)
         except (HTTPError, URLError, TimeoutError, ValueError) as exc:
             code = getattr(exc, 'code', None)
@@ -47,8 +47,8 @@ def main():
             print('ERROR: no progress; queue not complete', flush=True)
             return 1
         time.sleep(2)
-    print(f'INCOMPLETE: job time budget reached; resume using Run workflow. attempted={attempted}, succeeded={succeeded}', flush=True)
-    return 1
+    print(f'INCOMPLETE: job time budget reached; continuation requested. attempted={attempted}, succeeded={succeeded}', flush=True)
+    return 75 if attempted else 1
 
 
 if __name__ == '__main__':
